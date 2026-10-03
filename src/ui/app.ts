@@ -11,7 +11,6 @@ import { buildFxPanel, wetDryRow } from './fxPanel';
 import { buildSeqPanel } from './seqPanel';
 import { buildSheet } from './settings';
 import { TrackCard } from './trackCard';
-import { runViz } from './viz';
 import { fmtTime, h } from './dom';
 
 /** survives a rebuild of the UI (a project opening or a scene applying re-creates every control) */
@@ -63,9 +62,13 @@ export function mountApp(root: HTMLElement, engine: Engine) {
       say(engine.micError ?? 'No microphone available.');
       return;
     }
-    if (engine.startRecording(i)) {
-      cards[i].wave.setRecLevel(0, '00:00');
+    // the track is claimed at once; the mic may take a moment to open on a phone
+    const started = engine.startRecording(i);
+    cards[i].wave.setRecLevel(0, '00:00');
+    syncAll();
+    if (!(await started)) {
       syncAll();
+      say(engine.micError ?? 'Could not start the microphone.');
     }
   }
 
@@ -193,7 +196,6 @@ export function mountApp(root: HTMLElement, engine: Engine) {
   }
   syncPlay();
   syncAll();
-  runViz(cards.map((c) => c.viz), life);
 
   /* ------------------------------------------------------------- events -- */
 
@@ -205,12 +207,8 @@ export function mountApp(root: HTMLElement, engine: Engine) {
       inputBar.classList.toggle('hot', peak > 0.9);
       if (engine.recTrack >= 0) cards[engine.recTrack].wave.setRecLevel(peak);
     },
-    pos(track, v, rate) {
+    pos(track, v) {
       cards[track]?.wave.setPos(v);
-      cards[track]?.viz.pos(v, rate);
-    },
-    grains(track, list) {
-      cards[track]?.viz.grains(list, performance.now());
     },
     limiter(gr) {
       limiter.classList.toggle('on', gr < -1);

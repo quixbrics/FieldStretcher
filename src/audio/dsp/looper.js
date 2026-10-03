@@ -75,8 +75,6 @@ class FxmLooper extends FxBase {
     this.lastEngine = this.p.engine;
     this.grains = [];
     for (let i = 0; i < MAX_GRAINS; i++) this.grains.push({ on: false, pos: 0, rate: 1, age: 0, len: 1, amp: 0, gl: 1, gr: 1, delay: 0 });
-    this.evt = [];
-    this.evtIn = 0;
     // glide / tape state
     this.curSt = Math.max(0.01, this.p.stretch);
     this.rateS = null;
@@ -243,12 +241,6 @@ class FxmLooper extends FxBase {
         const rate = e === 'tape' ? this.rep : this.p.freeze ? 0 : this.dir() / this.curSt;
         this.port.postMessage({ type: 'pos', v: pos / this.len, r: rate });
       }
-      this.evtIn -= n;
-      if (this.evt.length && this.evtIn <= 0) {
-        this.evtIn = 1024;
-        this.port.postMessage({ type: 'grains', g: this.evt.splice(0, 24) });
-        this.evt.length = 0;
-      }
     }
     return this.guard(outputs);
   }
@@ -381,7 +373,6 @@ class FxmLooper extends FxBase {
     g.gr = Math.sin(th) * Math.SQRT2;
     // grains spawned mid-block start at the block's next render pass
     g.delay = 0;
-    if (this.report && this.evt.length < 48) this.evt.push([g.pos / this.len, glen / this.len, pan, semis, back]);
   }
 
   /* ---------------------------------------------------------- spectral -- */

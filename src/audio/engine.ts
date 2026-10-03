@@ -23,6 +23,7 @@ import {
 } from './loopfx';
 import { buildGraph, wetDryGains, wetPathGain, type GraphInit, type GraphNodes, type TrackNodes } from './graph';
 import { Sequencer, planSequence, type SeqSettings, type Step } from '../music/sequencer';
+import { loadAudioPrefs, saveAudioPrefs, type AudioPrefs, type SessionMode } from '../io/audioPrefs';
 
 /** Two loop tracks, both recorded from the mic. */
 export const TRACKS = 2;
@@ -221,8 +222,6 @@ export interface EngineEvents {
   bounceTime(seconds: number): void;
   /** mix recording hit its length limit */
   bounceAutoStop(): void;
-  /** granular grains just spawned: [position 0–1, length 0–1, pan, semitones, direction ±1] */
-  grains(track: number, grains: number[][]): void;
 }
 
 type SceneSound = { tape?: Partial<TapeSound>; spectral?: Partial<SpectralSound>; granular?: Partial<GranularSound> };
@@ -332,11 +331,17 @@ export class Engine {
   recTrack = -1;
   bouncing = false;
   /** audio-path facts for the Settings sheet */
-  diag: { ctxRate: number; micRate: number | null; take: TakeInfo | null } = { ctxRate: 0, micRate: null, take: null };
+  diag: { ctxRate: number; micRate: number | null; take: TakeInfo | null; session: string } = { ctxRate: 0, micRate: null, take: null, session: 'n/a' };
+  /** how the phone's audio session behaves (Settings → Audio) */
+  prefs: AudioPrefs = loadAudioPrefs();
 
   private g: GraphNodes | null = null;
   private capture: AudioWorkletNode | null = null;
   private stream: MediaStream | null = null;
+  private micSrc: MediaStreamAudioSourceNode | null = null;
+  /** the microphone has been allowed (it is only open while recording, unless asked to stay open) */
+  private micAllowed = false;
+  private startP: Promise<boolean> | null = null;
   private chunks: Float32Array[] = [];
   private recSamples = 0;
   private recDone: (() => void) | null = null;
@@ -388,7 +393,10 @@ export class Engine {
     return this.manualNote;
   }
   get hasMic(): boolean {
-    return this.capture !== null;
+    return this.micAllowed && this.capture !== null;
+  }
+  get micOpen(): boolean {
+    return this.stream !== null;
   }
 
   /** Must be called from a tap. Safe to call again (e.g. to resume). */
@@ -405,6 +413,8 @@ export class Engine {
     this.diag.ctxRate = ctx.sampleRate;
     ctx.onstatechange = () => this.events.ctxState?.(ctx.state);
     void ctx.resume();
+    // plain playback: the main speaker, and the silent switch does not mute us
+    this.setSession('playback');
     // fire the mic request now, inside the tap, in parallel with DSP loading
     const micP = this.askMic();
     await ensureWorklets(ctx);
@@ -417,13 +427,20 @@ export class Engine {
         if (m.type === 'pos') {
           this.lastPos[i] = m.v ?? 0;
           this.events.pos?.(i, m.v ?? 0, m.r ?? 0);
-        } else if (m.type === 'grains') this.events.grains?.(i, m.g ?? []);
+        }
       },
       blowup: () => this.events.blowup?.(),
     });
 
+    this.createCapture(ctx);
     const stream = await micP;
-    if (stream) this.attachMic(stream, ctx);
+    if (stream) {
+      // permission is now granted for this page. Unless asked to stay open, let the mic go again at once:
+      // an open microphone is what makes iOS treat the page like a phone call and use the earpiece.
+      this.micAllowed = true;
+      if (this.prefs.keepMicOpen) this.useStream(stream);
+      else stream.getTracks().forEach((t) => t.stop());
+    }
     this.events.ctxState?.(ctx.state);
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && ctx.state !== 'running') void ctx.resume();
@@ -707,10 +724,8 @@ export class Engine {
     }
   }
 
-  private attachMic(stream: MediaStream, ctx: AudioContext) {
-    this.stream = stream;
-    this.diag.micRate = stream.getAudioTracks()[0]?.getSettings().sampleRate ?? null;
-    const src = ctx.createMediaStreamSource(stream);
+  /** The capture node exists for the life of the page; the microphone is connected to it only while open. */
+  private createCapture(ctx: AudioContext) {
     const cap = workletNode(ctx, 'fs-capture', {}, 1, 1);
     cap.port.onmessage = (e) => {
       const m = e.data;
@@ -721,36 +736,100 @@ export class Engine {
     // the capture node outputs silence; it is wired to the destination only so it keeps running
     const mute = ctx.createGain();
     mute.gain.value = 0;
-    src.connect(cap).connect(mute).connect(ctx.destination);
+    cap.connect(mute).connect(ctx.destination);
     this.capture = cap;
-    // Keep the speaker (not the earpiece) and the silent switch out of the way. iOS 16.4+.
+  }
+
+  /** Tell iOS what kind of audio session this is (16.4+; elsewhere there is nothing to set). */
+  private setSession(type: SessionMode) {
     const nav = navigator as AudioSessionNav;
-    if (nav.audioSession) nav.audioSession.type = 'play-and-record';
+    try {
+      if (nav.audioSession) nav.audioSession.type = type;
+      this.diag.session = nav.audioSession ? nav.audioSession.type : 'not supported';
+    } catch {
+      this.diag.session = 'not supported';
+    }
+  }
+
+  private useStream(stream: MediaStream) {
+    if (!this.ctx || !this.capture) return;
+    this.stream = stream;
+    this.diag.micRate = stream.getAudioTracks()[0]?.getSettings().sampleRate ?? null;
+    this.micSrc = this.ctx.createMediaStreamSource(stream);
+    this.micSrc.connect(this.capture);
+    this.setSession(this.prefs.session);
     // if iOS or the user ends the mic stream, say so instead of recording silence
     for (const tr of stream.getAudioTracks())
       tr.addEventListener('ended', () => {
-        this.capture = null;
+        if (this.stream !== stream) return; // we closed it ourselves
+        this.stream = null;
+        this.micSrc = null;
         this.micError = 'The microphone was disconnected.';
+        this.micAllowed = false;
       });
+  }
+
+  /** Open the microphone if it is not already open. */
+  private async openMic(): Promise<boolean> {
+    if (this.stream) return true;
+    const stream = await this.askMic();
+    if (!stream) return false;
+    this.useStream(stream);
+    return true;
+  }
+
+  /** Let the microphone go and put the session back to plain playback (the main speaker). */
+  private closeMic() {
+    this.micSrc?.disconnect();
+    this.micSrc = null;
+    const s = this.stream;
+    this.stream = null;
+    s?.getTracks().forEach((t) => t.stop());
+    this.setSession('playback');
+    this.events.level?.(0);
+  }
+
+  /** Change how the audio session behaves (Settings → Audio). Takes effect now if the mic is open. */
+  setAudioPrefs(patch: Partial<AudioPrefs>) {
+    this.prefs = { ...this.prefs, ...patch };
+    saveAudioPrefs(this.prefs);
+    if (!this.started) return;
+    if (this.stream) this.setSession(this.prefs.session);
+    if ('keepMicOpen' in patch) {
+      if (this.prefs.keepMicOpen && this.micAllowed && this.recTrack < 0) void this.openMic();
+      else if (!this.prefs.keepMicOpen && this.recTrack < 0) this.closeMic();
+    }
   }
 
   /* ------------------------------------------------------------ record -- */
 
-  /** Record the mic onto a track. With Overdub on (and something already there) it layers over the loop instead of replacing it. */
-  startRecording(track: number): boolean {
-    if (!this.capture || this.recTrack >= 0 || track >= TRACKS) return false;
-    this.chunks = [];
-    this.recSamples = 0;
+  /**
+   * Record the mic onto a track. With Overdub on (and something already there) it layers over the loop instead of replacing it.
+   * The track is claimed at once; the microphone is opened if it was not already (a moment on a phone), and the take
+   * starts when it is ready.
+   */
+  startRecording(track: number): Promise<boolean> {
+    if (!this.hasMic || this.recTrack >= 0 || track >= TRACKS) return Promise.resolve(false);
     this.recTrack = track;
-    this.recWall0 = performance.now();
-    const loop = this.loops[track];
-    this.recOverdub = this.tracks[track].overdub && !!loop;
-    // an overdub lands where the loop is now; the loop keeps playing underneath
-    this.recOffset = loop ? Math.floor(this.lastPos[track] * loop[0].length) : 0;
-    this.applyMix(track);
-    this.capture.port.postMessage({ type: 'rec', on: true });
-    if (!this.playing) this.setPlaying(true);
-    return true;
+    this.startP = (async () => {
+      if (!(await this.openMic())) {
+        this.recTrack = -1;
+        this.applyMix(track);
+        return false;
+      }
+      this.chunks = [];
+      this.recSamples = 0;
+      this.recWall0 = performance.now();
+      const loop = this.loops[track];
+      this.recOverdub = this.tracks[track].overdub && !!loop;
+      // an overdub lands where the loop is now; the loop keeps playing underneath
+      this.recOffset = loop ? Math.floor(this.lastPos[track] * loop[0].length) : 0;
+      this.applyMix(track);
+      this.capture!.port.postMessage({ type: 'rec', on: true });
+      if (!this.playing) this.setPlaying(true);
+      return true;
+    })();
+    return this.startP;
   }
 
   private onChunk(data: Float32Array) {
@@ -765,6 +844,8 @@ export class Engine {
   async stopRecording(): Promise<RecResult> {
     const t = this.recTrack;
     if (t < 0 || !this.capture) return { ok: false, reason: 'idle' };
+    // stopped before the microphone had finished opening: let it open, there is just nothing in the take
+    if (this.startP && !(await this.startP)) return { ok: false, reason: 'idle' };
     const wall = (performance.now() - this.recWall0) / 1000;
     const done = new Promise<void>((res) => {
       this.recDone = res;
@@ -809,6 +890,7 @@ export class Engine {
       } else result = { ok: false, reason: res.reason };
     }
     this.applyMix(t);
+    if (!this.prefs.keepMicOpen) this.closeMic();
     return result;
   }
 
@@ -1205,7 +1287,7 @@ export class Engine {
 
   /** Release the mic and context. */
   dispose() {
-    this.stream?.getTracks().forEach((t) => t.stop());
+    this.closeMic();
     void this.ctx?.close();
   }
 }

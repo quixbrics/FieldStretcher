@@ -3,7 +3,9 @@ import './styles/app.css';
 import { Engine } from './audio/engine';
 import { mountApp } from './ui/app';
 import { attachAutosave } from './io/autosave';
+import { applyTheme, getTheme } from './ui/theme';
 
+applyTheme(getTheme());
 const engine = new Engine();
 mountApp(document.getElementById('app')!, engine);
 attachAutosave(engine);

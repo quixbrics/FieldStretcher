@@ -151,18 +151,6 @@ describe('granular controls', () => {
     };
     expect(crest(0)).toBeGreaterThan(crest(1));
   });
-  it('reports each grain for the cloud display, with reverse chance as its direction', () => {
-    const grains = (grev: number) => {
-      const { messages } = gran({ grev, density: 30 }, 2);
-      return messages.filter((m) => (m as { type: string }).type === 'grains').flatMap((m) => (m as { g: number[][] }).g);
-    };
-    const none = grains(0);
-    const all = grains(1);
-    expect(none.length).toBeGreaterThan(10);
-    expect(none.every((g) => g[4] === 1)).toBe(true);
-    expect(all.every((g) => g[4] === -1)).toBe(true);
-    expect(none.every((g) => g[0] >= 0 && g[0] <= 1 && g[1] > 0)).toBe(true);
-  });
 });
 
 describe('keeping the playhead when audio is swapped', () => {

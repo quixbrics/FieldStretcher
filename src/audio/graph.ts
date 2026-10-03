@@ -61,7 +61,7 @@ export interface GraphInit {
 
 export interface GraphHooks {
   safety?(m: { type: string; gr?: number; peak?: number }): void;
-  looper?(track: number, m: { type: string; v?: number; r?: number; g?: number[][] }): void;
+  looper?(track: number, m: { type: string; v?: number; r?: number }): void;
   blowup?(): void;
 }
 

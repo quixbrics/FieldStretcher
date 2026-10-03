@@ -1,12 +1,11 @@
 /*
- * One track's card: mode, a picture of what the mode is doing beside the waveform,
+ * One track's card: mode, the waveform with its loop window,
  * stretch / pitch (linked, like a tape reel) / glide, toggles, the mode's own Sound
  * controls, and a More section.
  */
 import { Engine, trackName, type EngineKind } from '../audio/engine';
 import { peakOf } from '../audio/loopfx';
 import { Wave } from './wave';
-import { ModeViz } from './viz';
 import { buildSoundPanel, type SoundPanel } from './soundPanel';
 import { fmtSemis, fmtStretch, fmtTime, h, posFromStretch, stretchFromPos } from './dom';
 
@@ -31,7 +30,6 @@ export interface CardHooks {
 export class TrackCard {
   readonly root: HTMLElement;
   readonly wave = new Wave();
-  readonly viz: ModeViz;
   private rec: HTMLButtonElement;
   private peakText = h('p', { class: 'hint mono' });
   private normBtn: HTMLButtonElement;
@@ -47,7 +45,6 @@ export class TrackCard {
 
   constructor(private engine: Engine, private i: number, hooks: CardHooks) {
     const t = engine.tracks[i];
-    this.viz = new ModeViz(engine, i);
 
     const range = (cls: string, min: number, max: number, step: number, value: number, label: string, onInput: (v: number) => void) => {
       const el = h('input', { class: `range ${cls}`, type: 'range', min, max, step, value, 'aria-label': `${trackName(i)} ${label}` });
@@ -81,7 +78,6 @@ export class TrackCard {
       h('button', { class: 'seg-btn', title: e.tip, 'aria-pressed': e.id === t.engine, onclick: () => {
         engine.setEngine(i, e.id);
         this.sound.show(e.id);
-        this.viz.setEngine(e.id);
         this.syncControls();
       } }, e.label),
     );
@@ -158,7 +154,7 @@ export class TrackCard {
 
     this.root = h('section', { class: 'track', style: `--c:var(--track-${i + 1});--cl:var(--track-${i + 1}-label)`, 'aria-label': trackName(i) },
       header,
-      h('div', { class: 'viewrow' }, this.viz.el, this.wave.el),
+      this.wave.el,
       h('div', { class: 'stretch' },
         h('div', { class: 'row' }, h('label', {}, 'Stretch'), this.stretchOut),
         this.stretch,
@@ -187,7 +183,6 @@ export class TrackCard {
     this.chips.forEach((b, k) => b.classList.toggle('on', Math.abs(Math.log(t.stretch / CHIPS[k])) < 0.03));
     this.engineBtns.forEach((b, k) => b.setAttribute('aria-pressed', String(ENGINES[k].id === t.engine)));
     this.sound.show(t.engine);
-    this.viz.setEngine(t.engine);
     this.linkNote.textContent = t.link
       ? t.engine === 'tape'
         ? 'Linked, like a tape reel: slower is lower, faster is higher.'

@@ -22,11 +22,12 @@
     html[data-theme='light'] body { background: #f6f8fa; color: #17202a; }
   </style>
   <script>
-    // theme: a choice made in any Maker app wins, otherwise follow the phone
+    // theme: dark unless light was chosen in Settings (it does not follow the phone's own setting)
     try {
-      var t = localStorage.getItem('scapemaker.theme');
-      if (!t && window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) t = 'light';
-      if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+      if (localStorage.getItem('scapemaker.theme') === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+        document.querySelector('meta[name="theme-color"]').setAttribute('content', '#f6f8fa');
+      }
     } catch (e) {}
   </script>
 </head>

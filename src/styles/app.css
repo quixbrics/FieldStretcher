@@ -222,18 +222,6 @@ h1, h2, h3, p { margin: 0; }
 .sheet-body .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .sheet-body .seg { flex: none; }
 
-/* ---- the picture of the mode, beside the waveform ---- */
-.viewrow { display: flex; gap: 8px; align-items: stretch; }
-.viewrow .wave { flex: 1; min-width: 0; height: 84px; }
-.viz { width: 84px; height: 84px; flex: none; background: var(--inset); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; color: var(--c); position: relative; }
-.viz-svg, .viz-canvas { position: absolute; inset: 0; width: 100%; height: 100%; color: var(--c); }
-.viz-svg .flange { stroke: var(--border-strong); stroke-width: 1; }
-.viz-svg .pack { fill: var(--c); fill-opacity: 0.28; stroke: var(--c); stroke-width: 1; }
-.viz-svg .hub { stroke: var(--text-2); stroke-width: 1.4; }
-.viz-svg .spoke { stroke: var(--text-2); stroke-width: 2; stroke-linecap: round; }
-.viz-svg .tape-line { stroke: var(--c); stroke-width: 1.6; stroke-linejoin: round; }
-.viz-svg .tape-head { fill: var(--text-muted); }
-
 /* ---- the mode's own controls ---- */
 .sound-sec summary, .more summary { list-style: none; min-height: 34px; display: flex; align-items: center; color: var(--text-muted); font-size: 13px; cursor: pointer; }
 .sound-sec summary::-webkit-details-marker { display: none; }
@@ -283,3 +271,4 @@ h1, h2, h3, p { margin: 0; }
 .fx-card > header { align-items: center; }
 .fx-card > header .sub { margin-left: 8px; }
 .fx-card.off > :not(header) { opacity: 0.45; }
+.sheet .seg { margin-bottom: 4px; }

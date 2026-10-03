@@ -11,6 +11,8 @@ import { packProject, shareOrDownload, stamp, unpackProject } from '../io/projec
 import { SCENES } from '../io/scenes';
 import { deleteUserScene, loadUserScenes, saveUserScene } from '../io/userScenes';
 import { makeZip } from '../io/zip';
+import type { SessionMode } from '../io/audioPrefs';
+import { getTheme, setTheme, type Theme } from './theme';
 import { fmtTime, h } from './dom';
 
 export interface SheetHelpers {
@@ -160,12 +162,37 @@ export function buildSheet(engine: Engine, hp: SheetHelpers): Sheet {
     }
   } }, 'Render');
 
+  /* ---- appearance and audio ---- */
+  const themeBtns = (['dark', 'light'] as Theme[]).map((t) =>
+    h('button', { class: 'seg-btn', 'aria-pressed': getTheme() === t, onclick: () => {
+      setTheme(t);
+      themeBtns.forEach((b, k) => b.setAttribute('aria-pressed', String((['dark', 'light'] as Theme[])[k] === t)));
+    } }, t === 'dark' ? 'Dark' : 'Light'),
+  );
+  const SESSIONS: { id: SessionMode; label: string }[] = [
+    { id: 'play-and-record', label: 'Call' },
+    { id: 'playback', label: 'Speaker' },
+    { id: 'auto', label: 'Auto' },
+  ];
+  const sessionBtns = SESSIONS.map((m) =>
+    h('button', { class: 'seg-btn', 'aria-pressed': engine.prefs.session === m.id, onclick: () => {
+      engine.setAudioPrefs({ session: m.id });
+      sessionBtns.forEach((b, k) => b.setAttribute('aria-pressed', String(SESSIONS[k].id === m.id)));
+      refreshInfo();
+    } }, m.label),
+  );
+  const keepOpen = h('button', { class: 'tog', 'aria-pressed': engine.prefs.keepMicOpen, onclick: () => {
+    engine.setAudioPrefs({ keepMicOpen: !engine.prefs.keepMicOpen });
+    keepOpen.setAttribute('aria-pressed', String(engine.prefs.keepMicOpen));
+    refreshInfo();
+  } }, 'Keep the microphone open');
+
   const info = h('p', { class: 'hint mono' });
   const refreshInfo = () => {
     const d = engine.diag;
     const t = d.take;
     info.textContent =
-      `Audio ${d.ctxRate || '–'} Hz · mic ${d.micRate ?? 'n/a'} Hz` +
+      `Audio ${d.ctxRate || '–'} Hz · mic ${d.micRate ?? 'n/a'} Hz · session ${d.session} · mic ${engine.micOpen ? 'open' : 'closed'}` +
       (t ? ` · last take ${t.heardSeconds.toFixed(1)} s heard / ${t.realSeconds.toFixed(1)} s real${t.repaired !== 1 ? ` — speed corrected ×${(1 / t.repaired).toFixed(2)}` : ''}` : '');
   };
 
@@ -195,6 +222,13 @@ export function buildSheet(engine: Engine, hp: SheetHelpers): Sheet {
       h('div', { class: 'toggles' }, stemBtn),
       renderBtn,
       status,
+      h('h3', {}, 'Appearance'),
+      h('div', { class: 'seg' }, ...themeBtns),
+      h('h3', {}, 'Audio'),
+      h('p', { class: 'hint' }, 'The microphone is only open while you record, so the rest of the time sound plays through the main speaker. While recording, iPhones may switch to the earpiece (Call). To keep the speaker while recording, try Speaker; if a take then comes out silent, go back to Call. Headphones avoid the question.'),
+      h('div', { class: 'seg' }, ...sessionBtns),
+      h('div', { class: 'toggles' }, keepOpen),
+      h('p', { class: 'hint' }, 'Keeping it open gives a live input meter, but an open microphone can make the phone play through the earpiece.'),
       h('h3', {}, 'Recording'),
       h('p', { class: 'hint' }, `Use headphones so the mic does not hear the speaker. Takes run up to ${MAX_SECONDS} seconds and are recorded as they are: use Normalise (under More) to bring a quiet one up. ● Mix next to Play records everything you hear (up to ${fmtTime(MAX_MIX_SECONDS)}).`),
       info,
