@@ -48,6 +48,10 @@ export function mountApp(root: HTMLElement, engine: Engine) {
 
   /* ------------------------------------------------------------ cards -- */
 
+  const showMicNote = () => {
+    micNote.textContent = engine.micError ? `${engine.micError} Tap the red button to try again.` : '';
+    micNote.hidden = !engine.micError;
+  };
   const cards: TrackCard[] = [];
   const syncAll = () => {
     cards.forEach((c) => c.syncState());
@@ -58,10 +62,6 @@ export function mountApp(root: HTMLElement, engine: Engine) {
     if (!engine.started) await engine.start();
     if (engine.recTrack === i) return stopRec();
     if (engine.recTrack >= 0) return;
-    if (!engine.hasMic) {
-      say(engine.micError ?? 'No microphone available.');
-      return;
-    }
     // the track is claimed at once; the mic may take a moment to open on a phone
     const started = engine.startRecording(i);
     cards[i].wave.setRecLevel(0, '00:00');
@@ -69,6 +69,9 @@ export function mountApp(root: HTMLElement, engine: Engine) {
     if (!(await started)) {
       syncAll();
       say(engine.micError ?? 'Could not start the microphone.');
+      showMicNote();
+    } else {
+      micNote.hidden = true;
     }
   }
 
@@ -180,16 +183,14 @@ export function mountApp(root: HTMLElement, engine: Engine) {
         }
         splash.remove();
         syncPlay();
+        showMicNote();
       } }, 'Tap to start'),
     ),
   );
 
   root.replaceChildren(...(engine.started ? [shell] : [shell, splash]));
   root.removeAttribute('aria-busy');
-  if (engine.micError) {
-    micNote.textContent = engine.micError;
-    micNote.hidden = false;
-  }
+  showMicNote();
   if (pendingMessage) {
     say(pendingMessage);
     pendingMessage = '';

@@ -8,7 +8,7 @@ generative sequencer walking the resonator through a scale.
 **Static PWA. No backend, no accounts, no running cost.** Open the site in
 Safari, Share → Add to Home Screen, and it runs full-screen and offline.
 
-## Status: v3.1
+## Status: v3.2
 
 | Phase | Scope | State |
 |---|---|---|
@@ -18,7 +18,8 @@ Safari, Share → Add to Home Screen, and it runs full-screen and offline.
 | 4 | Autosave, project files, mix recording, scenes | built |
 | v2 | Per-mode sound controls and pictures; stretch glide; overdub; Normalise button (no auto-normalise); offline render with stems; saveable scenes | built |
 | v3 | Bounce track and dubbing removed (two tracks). One Wet/Dry control replaces sends and per-effect mixes (each effect has an on/off switch). Pitch and stretch linked, like a tape reel | built |
-| v3.1 | **Animated mode pictures removed.** **Light / dark switch** in Settings (dark by default). **Mic opened only while recording**, so playback uses the speaker | **built** |
+| v3.1 | Animated mode pictures removed. Light / dark switch in Settings (dark by default). Mic opened only while recording, so playback uses the speaker | built |
+| v3.2 | **Mic prompt restored** (the session is no longer set before the first request) and the audio-mode settings removed; a failed request now shows a banner and recording retries it | **built** |
 
 ## Develop
 
@@ -54,7 +55,7 @@ ways to test on an iPhone: deploy to GitHub Pages, or tunnel the dev server
 | Pitch ⇄ stretch | `engine.ts` (`setStretch`, `setPitch`, `setLink`, `effectivePitch`) | On tape, speed = 2^(pitch/12) ÷ stretch, so the two controls fight. **Link** (on by default for tape) makes them one: the stretch slider moves the pitch slider (−12 st per doubling, shown within ±24) and the pitch slider moves the stretch. Linked on tape the engine just plays at 1 ÷ stretch. Spectral and Granular start unlinked (stretch without changing pitch — their point) and can be linked to drop the pitch as they stretch. Switching modes and toggling Link keep the sound you were hearing where possible. Stretch is 0.25× – 1000× (below 1× is faster). |
 | Mode controls | `dsp/looper.js`, `soundPanel.ts` | **Tape**: wow, flutter, saturate, wear, hiss, motor inertia (Glide), stopping fades out. **Spectral**: smear (FFT size), width, tilt, focus (tonal ↔ diffuse). **Granular**: grain, density, scatter, spray, width, shape (sharp ↔ smooth), backwards chance. Each mode keeps its own values. |
 | Glide | `looper.js` | The stretch ratio eases to its target (log domain) over `glide` seconds in every mode; on tape it is the motor's inertia. |
-| Audio session | `engine.ts`, `io/audioPrefs.ts` | The microphone is opened **only while recording** (and released after), so the rest of the time iOS plays through the main speaker (`navigator.audioSession` = `playback`). An open mic makes an iPhone treat the page like a call and use the earpiece. While the mic is open the session follows Settings → Audio (`play-and-record` by default, which is known to record; `playback` or `auto` to try). Permission is asked once, in the first tap. "Keep the microphone open" restores the always-on input meter. |
+| Audio session | `engine.ts` | One fixed behaviour, no settings. The microphone permission is requested in the first tap with the audio session **untouched** (iOS does not capture in a plain-playback session, so setting `playback` first made the request fail without a prompt). The mic is then released at once and opened only for each take, with the session set to `play-and-record` *before* the request; afterwards it goes back to `playback`, so the rest of the time iOS plays through the main speaker (an open mic makes an iPhone treat the page like a call and use the earpiece). If the first request failed, tapping record asks again. Settings shows the current session and whether the mic is open. |
 | Theme | `ui/theme.ts` | Dark by default; light is a choice in Settings. It does **not** follow the phone's own light/dark setting. Stored under `scapemaker.theme`, shared with the other Maker apps. |
 | Graph | `graph.ts` | One builder for live playback and offline render. |
 | Offline render | `render.ts` | `OfflineAudioContext`: the mix and optionally each track as a stem, 15 s – 5 min, loops from the top, sequencer replayed from its seed with every note queued up front (bit-for-bit repeatable), 20 ms fade-in and a fade-out at the end. Mix + stems arrive as one zip. |
