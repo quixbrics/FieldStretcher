@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>FieldStretcher</title>
+  <meta name="description" content="Record the world with your phone, stretch it into drones, and wash it through resonance, delay and reverb — a companion to ScapeMaker, ToneMaker and FXMaker." />
+  <meta name="theme-color" content="#0d1117" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="FieldStretcher" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="icon.svg" />
+  <link rel="apple-touch-icon" href="icon-180.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { background: #0d1117; color: #dce4ec; }
+    html[data-theme='light'] body { background: #f6f8fa; color: #17202a; }
+  </style>
+  <script>
+    // theme: a choice made in any Maker app wins, otherwise follow the phone
+    try {
+      var t = localStorage.getItem('scapemaker.theme');
+      if (!t && window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) t = 'light';
+      if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <div id="app" aria-busy="true"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
