@@ -6,6 +6,7 @@ import { Engine, TRACKS, type EngineKind, type Quality } from '../audio/engine';
 import { MAX_SECONDS } from '../audio/loopfx';
 import { Wave } from './wave';
 import { buildFxPanel } from './fxPanel';
+import { buildSeqPanel } from './seqPanel';
 import { fmtSemis, fmtStretch, fmtTime, h, posFromStretch, stretchFromPos } from './dom';
 
 const ENGINES: { id: EngineKind; label: string; tip: string }[] = [
@@ -249,15 +250,16 @@ export function mountApp(root: HTMLElement, engine: Engine) {
 
   const trackList = h('main', { class: 'tracks', id: 'tab-tracks' }, micNote, ...cards.map((c) => c.root));
   const fxList = h('main', { class: 'tracks', id: 'tab-fx', hidden: true }, buildFxPanel(engine));
-  const panels = [trackList, fxList];
-  const tabBtns = ['Tracks', 'FX'].map((label, k) =>
+  const seqList = h('main', { class: 'tracks', id: 'tab-seq', hidden: true }, buildSeqPanel(engine));
+  const panels = [trackList, fxList, seqList];
+  const tabBtns = ['Tracks', 'FX', 'Seq'].map((label, k) =>
     h('button', { class: 'tab', role: 'tab', 'aria-selected': k === 0, onclick: () => {
       tabBtns.forEach((b, j) => b.setAttribute('aria-selected', String(j === k)));
       panels.forEach((p, j) => (p.hidden = j !== k));
     } }, label),
   );
   const tabs = h('nav', { class: 'tabs', role: 'tablist' }, ...tabBtns);
-  const shell = h('div', { class: 'shell' }, header, tabs, banner, trackList, fxList, transport, sheet, toast);
+  const shell = h('div', { class: 'shell' }, header, tabs, banner, trackList, fxList, seqList, transport, sheet, toast);
 
   /* ------------------------------------------------------------- splash -- */
 

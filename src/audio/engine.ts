@@ -17,6 +17,7 @@
  */
 import { ensureWorklets, workletNode } from './worklets';
 import { MAX_SECONDS, computePeaks, concat, prepareLoop, toMono } from './loopfx';
+import { Sequencer, type SeqSettings, type Step } from '../music/sequencer';
 
 export const TRACKS = 4;
 export type EngineKind = 'spectral' | 'granular' | 'tape';
@@ -50,6 +51,12 @@ export interface ResoState {
   bright: number;
   spread: number;
   glide: number;
+  /** noise burst on every note change (0 = off) */
+  pluck: number;
+  /** pluck whenever the incoming audio has a hit in it: detector sensitivity (0 = off) */
+  onset: number;
+  /** how much of the incoming audio rings the strings */
+  input: number;
   mix: number;
 }
 export interface DelayState {
@@ -82,8 +89,16 @@ export const NOTE_NAMES = ['C', 'C♯', 'D', 'E♭', 'E', 'F', 'F♯', 'G', 'A�
 /** MIDI note of a root + octave (octave 3, A = 57 = A3 = 220 Hz) */
 export const noteOf = (root: number, octave: number): number => 12 * (octave + 1) + root;
 
+export interface SeqState {
+  on: boolean;
+  /** seconds per step */
+  rate: number;
+}
+/** How far ahead notes are handed to the audio thread (so a throttled timer never drops a step). */
+const LOOKAHEAD = 1.2;
+
 const defaultFx = (): FxState => ({
-  reso: { root: 9, octave: 3, chord: 2, decay: 0.6, bright: 0.5, spread: 0.3, glide: 0.4, mix: 0.5 },
+  reso: { root: 9, octave: 3, chord: 2, decay: 0.7, bright: 0.5, spread: 0.3, glide: 0.4, pluck: 0, onset: 0, input: 1, mix: 0.5 },
   delay: { time: 420, feedback: 0.5, tone: 0.6, pingpong: true, mix: 0.3 },
   reverb: { size: 1, decay: 8, damping: 0.4, shimmer: 0, freeze: false, mix: 0.35 },
   level: 0.8,
@@ -149,6 +164,8 @@ export class Engine {
     seconds: 0,
   }));
   fx: FxState = defaultFx();
+  seq: SeqState = { on: false, rate: 3 };
+  sequencer = new Sequencer({ scale: 'dorian', motion: 'drift', range: 2, chance: 0.85, chordSize: 0, seed: 1 });
   /** waveform peaks per track (null = empty) */
   peaks: (Float32Array | null)[] = Array(TRACKS).fill(null);
   /** the loop audio itself (mono), kept for export and redraw */
@@ -172,12 +189,23 @@ export class Engine {
   private recDone: (() => void) | null = null;
   private wake: { release(): Promise<void> } | null = null;
   private starting: Promise<void> | null = null;
+  private seqTimer = 0;
+  private seqNext = 0;
+  private seqLast = 0;
+  /** a tapped note is holding the resonator off the Key setting */
+  private manualNote = false;
+  private seqLog: { at: number; step: Step }[] = [];
+  private fxListeners = new Set<() => void>();
 
   get started(): boolean {
     return this.nodes.length > 0;
   }
   get sampleRate(): number {
     return this.ctx?.sampleRate ?? 48000;
+  }
+  /** a tapped note is holding the resonator (the sequencer is off) */
+  get holding(): boolean {
+    return this.manualNote;
   }
   get hasMic(): boolean {
     return this.capture !== null;
@@ -272,7 +300,13 @@ export class Engine {
 
   private resoParams() {
     const r = this.fx.reso;
-    return { note: noteOf(r.root, r.octave), chord: r.chord, decay: r.decay, bright: r.bright, spread: r.spread, glide: r.glide };
+    const p: Record<string, number> = { chord: r.chord, decay: r.decay, bright: r.bright, spread: r.spread, glide: r.glide, pluck: r.pluck, onset: r.onset, input: r.input };
+    // while the sequencer (or a tapped note) owns the pitch, the Key setting must not overwrite it
+    if (!this.seq.on && !this.manualNote) p.note = this.tonic();
+    return p;
+  }
+  private tonic(): number {
+    return noteOf(this.fx.reso.root, this.fx.reso.octave);
   }
   private delayParams() {
     const d = this.fx.delay;
@@ -292,6 +326,11 @@ export class Engine {
 
   updateFx<K extends 'reso' | 'delay' | 'reverb'>(section: K, patch: Partial<FxState[K]>) {
     Object.assign(this.fx[section], patch);
+    for (const l of this.fxListeners) l();
+    if (section === 'reso' && ('root' in patch || 'octave' in patch)) {
+      this.manualNote = false;
+      if (this.seq.on) this.seqReschedule(true);
+    }
     if (!this.ctx || !this.stages) return;
     const st = this.stages[section];
     const params = section === 'reso' ? this.resoParams() : section === 'delay' ? this.delayParams() : this.reverbParams();
@@ -306,6 +345,114 @@ export class Engine {
   setFxLevel(v: number) {
     this.fx.level = v;
     if (this.ctx) this.busOut.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
+  }
+
+  /* ---------------------------------------------------------- sequencer -- */
+
+  /** UI hook: runs whenever any FX/sequencer value changes (to keep duplicate controls in step). */
+  onFxChange(fn: () => void): void {
+    this.fxListeners.add(fn);
+  }
+
+  setSeqOn(on: boolean) {
+    this.seq.on = on;
+    this.manualNote = false;
+    if (!this.ctx || !this.stages) return;
+    window.clearInterval(this.seqTimer);
+    this.stages.reso.node.port.postMessage({ type: 'clear' });
+    this.seqLog = [];
+    if (on) {
+      // sound the current note first, then step on from there
+      const at = this.ctx.currentTime + 0.05;
+      this.sendStep(this.sequencer.describe(this.sequencer.index), at, 0);
+      this.seqLast = at;
+      this.seqNext = at + this.seq.rate;
+      this.seqTimer = window.setInterval(() => this.seqTick(), 120);
+      this.seqTick();
+    } else {
+      // back to the Key setting (and the chord shape), gliding there
+      this.stages.reso.node.port.postMessage({ type: 'chord' });
+      this.stages.reso.node.port.postMessage({ type: 'params', params: this.resoParams() });
+    }
+    for (const l of this.fxListeners) l();
+  }
+
+  updateSeq(patch: Partial<SeqSettings> & { rate?: number }) {
+    const { rate, ...settings } = patch;
+    if (rate !== undefined) this.seq.rate = rate;
+    Object.assign(this.sequencer.s, settings);
+    if (patch.range !== undefined || patch.scale !== undefined) this.sequencer.set(Math.min(this.sequencer.index, this.sequencer.max));
+    for (const l of this.fxListeners) l();
+    if (this.seq.on) this.seqReschedule(patch.scale !== undefined || patch.chordSize !== undefined || patch.range !== undefined);
+    else if (patch.chordSize !== undefined && this.stages && this.manualNote) this.seqSet(this.sequencer.index);
+  }
+
+  /** a new seed: a new line, from the tonic */
+  reseed(seed = Math.floor(Math.random() * 1e6)) {
+    this.sequencer.reseed(seed);
+    for (const l of this.fxListeners) l();
+    if (this.seq.on) this.seqReschedule(true);
+  }
+
+  /** Play a scale note now (a tapped note); it holds until the sequencer moves on. */
+  seqSet(index: number) {
+    if (!this.ctx || !this.stages) return;
+    const step = this.sequencer.set(index);
+    if (!this.seq.on) {
+      this.manualNote = true;
+      this.stages.reso.node.port.postMessage({ type: 'params', params: this.resoParams() });
+    } else this.seqReschedule(false);
+    this.sendStep(step, this.ctx.currentTime + 0.02, 0);
+    for (const l of this.fxListeners) l();
+  }
+
+  /** Drop what is queued and re-plan from the current settings. `replay` re-sounds the current note. */
+  private seqReschedule(replay: boolean) {
+    if (!this.ctx || !this.stages) return;
+    const now = this.ctx.currentTime;
+    this.stages.reso.node.port.postMessage({ type: 'clear' });
+    this.seqLog = this.seqLog.filter((e) => e.at <= now);
+    this.seqNext = Math.max(now + 0.05, this.seqLast + this.seq.rate);
+    if (replay) {
+      const at = now + 0.03;
+      this.sendStep(this.sequencer.describe(this.sequencer.index), at, 0);
+      this.seqNext = Math.max(this.seqNext, at + this.seq.rate);
+      this.seqLast = at;
+    }
+  }
+
+  private seqTick() {
+    if (!this.seq.on || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    if (this.seqNext < now) this.seqNext = now + 0.05;
+    while (this.seqNext < now + LOOKAHEAD) {
+      const step = this.sequencer.next();
+      if (step) this.sendStep(step, this.seqNext, 0);
+      this.seqLast = this.seqNext;
+      this.seqNext += this.seq.rate;
+    }
+    this.seqLog = this.seqLog.filter((e) => e.at > now - 10);
+  }
+
+  private sendStep(step: Step, at: number, pluck: number) {
+    if (!this.ctx || !this.stages) return;
+    this.stages.reso.node.port.postMessage({
+      type: 'note',
+      frame: Math.round(at * this.ctx.sampleRate),
+      note: this.tonic() + step.semis,
+      offsets: step.offsets,
+      pluck,
+    });
+    this.seqLog.push({ at, step });
+  }
+
+  /** The step that is sounding right now (for the display). */
+  currentStep(): Step | null {
+    if (!this.ctx) return null;
+    const now = this.ctx.currentTime;
+    let cur: Step | null = null;
+    for (const e of this.seqLog) if (e.at <= now) cur = e.step;
+    return cur;
   }
 
   private async askMic(): Promise<MediaStream | null> {

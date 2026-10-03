@@ -59,6 +59,74 @@ describe('resonator', () => {
   });
 });
 
+describe('resonator plucks', () => {
+  const silent = () => [new Float32Array(SR * 3), new Float32Array(SR * 3)];
+  const rms = (x: Float32Array, a: number, b: number) => stats([x.subarray(Math.floor(a * SR), Math.floor(b * SR))]).rms;
+
+  it('decay goes down to a 20 ms pluck: a short decay dies away fast, a long one rings', () => {
+    const run = (decay: number) =>
+      render('fxm-reso', silent(), 3, { params: { note: 57, chord: 0, decay, pluck: 1, input: 0 }, messages: [[0.5, { type: 'params', params: { note: 60 } }]] }).out[0];
+    const short = run(0.1);
+    const long = run(0.9);
+    expect(rms(short, 0.5, 0.56)).toBeGreaterThan(0.005); // there is a pluck…
+    expect(rms(short, 1.5, 2)).toBeLessThan(rms(short, 0.5, 0.56) * 0.05); // …that is gone within a second
+    expect(rms(long, 1.5, 2)).toBeGreaterThan(rms(short, 1.5, 2) * 20);
+  });
+  it('a note change plucks the strings with no audio coming in; a repeat of the same note does not', () => {
+    const { out } = render('fxm-reso', silent(), 3, {
+      params: { note: 57, chord: 0, decay: 0.45, pluck: 0.8, input: 0 },
+      messages: [[0.5, { type: 'params', params: { note: 60 } }], [1.5, { type: 'params', params: { note: 60 } }], [2.0, { type: 'params', params: { note: 64 } }]],
+    });
+    expect(rms(out[0], 0.2, 0.45)).toBe(0);
+    expect(rms(out[0], 0.5, 0.7)).toBeGreaterThan(0.005);
+    expect(rms(out[0], 1.5, 1.52)).toBeLessThan(rms(out[0], 0.5, 0.52)); // not re-plucked at 1.5
+    expect(rms(out[0], 2.0, 2.1)).toBeGreaterThan(rms(out[0], 1.9, 1.99) * 1.5); // plucked again at 2.0
+  });
+  it('Pluck at 0 leaves a note change silent when nothing is coming in', () => {
+    const { out } = render('fxm-reso', silent(), 2, { params: { note: 57, chord: 0, pluck: 0, input: 0 }, messages: [[0.5, { type: 'params', params: { note: 62 } }]] });
+    expect(stats(out).peak).toBe(0);
+  });
+  it('Onset plucks on hits in the input even with the input itself muted', () => {
+    const x = silent();
+    for (const t of [0.5, 1.2, 2.0]) for (let i = 0; i < 400; i++) (x[0][Math.floor(t * SR) + i] = 0.8 * Math.exp(-i / 60) * (i % 2 ? 1 : -1)), (x[1][Math.floor(t * SR) + i] = x[0][Math.floor(t * SR) + i]);
+    const off = render('fxm-reso', x, 3, { params: { note: 57, chord: 0, decay: 0.4, onset: 0, pluck: 0.5, input: 0 } }).out[0];
+    const on = render('fxm-reso', x, 3, { params: { note: 57, chord: 0, decay: 0.4, onset: 0.8, pluck: 0.5, input: 0 } }).out[0];
+    expect(stats([off]).peak).toBe(0);
+    for (const t of [0.5, 1.2, 2.0]) expect(rms(on, t + 0.01, t + 0.15)).toBeGreaterThan(0.003);
+    expect(rms(on, 0.2, 0.45)).toBe(0);
+  });
+  it('Input scales how much audio rings the strings', () => {
+    const run = (input: number) => rms(render('fxm-reso', noise(2, 0.3), 2, { params: { note: 57, chord: 0, decay: 0.5, input } }).out[0], 1, 2);
+    expect(run(1)).toBeGreaterThan(run(0.25) * 2);
+    expect(run(0)).toBe(0);
+  });
+  it('a queued note sounds at its frame, not before, at the right pitch', () => {
+    const { out } = render('fxm-reso', silent(), 3, {
+      params: { note: 57, chord: 0, decay: 0.8, pluck: 1, input: 0, glide: 0.01 },
+      messages: [[0, { type: 'note', frame: Math.round(1.0 * SR), note: 69, offsets: null }]],
+    });
+    expect(rms(out[0], 0.2, 0.95)).toBe(0);
+    expect(rms(out[0], 1.0, 1.3)).toBeGreaterThan(0.005);
+    const f = peakFreq(out[0].subarray(Math.floor(1.1 * SR), Math.floor(2.1 * SR)), 400, 480, 0.5);
+    expect(Math.abs(f - 440)).toBeLessThan(5);
+  });
+  it('clear drops queued notes', () => {
+    const { out } = render('fxm-reso', silent(), 3, {
+      params: { note: 57, chord: 0, pluck: 1, input: 0 },
+      messages: [[0, { type: 'note', frame: Math.round(1.5 * SR), note: 69 }], [0.5, { type: 'clear' }]],
+    });
+    expect(stats(out).peak).toBe(0);
+  });
+  it('a queued note can carry its own chord offsets', () => {
+    const { out } = render('fxm-reso', silent(), 3, {
+      params: { note: 57, chord: 0, decay: 0.8, pluck: 1, input: 0, glide: 0.01 },
+      messages: [[0, { type: 'note', frame: Math.round(0.5 * SR), note: 57, offsets: [0, 7] }], [0, { type: 'note', frame: Math.round(0.6 * SR), note: 58, offsets: [0, 7] }]],
+    });
+    const f = peakFreq(out[0].subarray(Math.floor(1.2 * SR), Math.floor(2.2 * SR)), 335, 360, 0.5); // 233.1 × 1.5 = 349.7
+    expect(Math.abs(f - 349.7)).toBeLessThan(4);
+  });
+});
+
 describe('delay', () => {
   it('first echo arrives at the delay time (100 ms), and nothing before it', () => {
     const { out } = render('fxm-delay', impulse(1), 1, { params: { timeL: 100, timeR: 100, feedback: 0, drive: 0, wobble: 0, lowcut: 10, highcut: 20000 } });

@@ -8,13 +8,13 @@ generative sequencer walking the resonator through a scale.
 **Static PWA. No backend, no accounts, no running cost.** Open the site in
 Safari, Share → Add to Home Screen, and it runs full-screen and offline.
 
-## Status: Phase 2 (FX bus)
+## Status: Phase 3 (sequencer)
 
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Mic capture, 4 loop tracks, Spectral / Granular / Tape stretch, pitch, reverse, freeze, loop window, level/pan/mute, safety limiter, mobile UI, PWA shell | **built** |
 | 2 | FX bus: resonator → delay → reverb, per-track sends, FX tab | **built** |
-| 3 | Generative sequencer: scale, motion modes, glide, seed | |
+| 3 | Generative sequencer: scale, motion modes, glide, chance, seed; resonator plucks | **built** |
 | 4 | Project save, WAV export + iOS share sheet, presets, polish, Maker Suite card | |
 
 ## Develop
@@ -41,6 +41,8 @@ ways to test on an iPhone: deploy to GitHub Pages, or tunnel the dev server
 | Takes | `src/audio/loopfx.ts` | DC removed, 20 ms equal-power seam crossfade, normalised to −3 dBFS (gain capped +40 dB; a silent take is refused, not boosted), 0.25–30 s. |
 | Engine | `src/audio/engine.ts` | One context created inside the first tap (mic request fired in the same tap). track: looper → level → pan → master → safety → out. Handles `audioSession`, wake lock, resume after interruption. |
 | FX bus | `dsp/fx-bus.js`, `engine.ts` | reso → delay → reverb, each blended dry/wet (equal power) by gain nodes, then a return fader. Reverb (8-line FDN, optional shimmer and freeze) and tape delay are FXMaker's processors unchanged. The resonator is FXMaker's string bank cut down to one **continuous MIDI note** + chord shape (up to 8 strings), with a `glide` time and an `offsets` message so the Phase 3 sequencer can move it and stack scale-based chords. Sends are **pre-fader**: Level down + Send up = wet-only. |
+| Resonator plucks | `dsp/fx-bus.js` | Decay runs 20 ms → 30 s. **Pluck** puts a 4 ms noise burst into the strings on every note *change*; **Onset** plucks whenever the audio sent in has a hit (fast/slow envelope detector, 80 ms refractory); **Input** sets how much audio rings the strings (0 = pluck-only). Presets: Drone / Pluck / Tick. |
+| Sequencer | `src/music/sequencer.ts`, `engine.ts`, `src/ui/seqPanel.ts` | A seeded, pure walk through a scale (ToneMaker's 8 modes, `src/music/theory.ts`): **Drift**, **Arp** (in thirds, bouncing), **Markov** (favours tonic/fifth/third), **Wander** (smooth curve), **Hold** (tap a note). Step 0.15–30 s, glide, chance, 1–3 octave range, optional chord stacked from scale thirds, dice for a new seed. The engine hands notes to the resonator ~1.2 s ahead as **timed messages** (absolute audio frame), so a throttled timer or a busy main thread never drops or jitters a step. |
 | UI | `src/ui/*`, `src/styles/*` | Vanilla TS, portrait, 44 px targets, safe-area insets. `tokens.css` is shared verbatim with the other Maker apps. |
 
 ### Stretch engines
