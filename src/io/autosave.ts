@@ -4,7 +4,7 @@
  * a track's audio only when that track's audio changed. Everything fails
  * quietly — private browsing or a full disk must never break the app.
  */
-import type { Engine, ProjectData } from '../audio/engine';
+import { TRACKS, type Engine, type Loop, type ProjectData } from '../audio/engine';
 
 const DB = 'fieldstretcher';
 const STORE = 'kv';
@@ -42,7 +42,7 @@ async function get<T>(key: string): Promise<T | undefined> {
 
 export interface Saved {
   project: ProjectData;
-  audio: (Float32Array | null)[];
+  loops: (Loop | null)[];
   sampleRate: number;
 }
 
@@ -50,9 +50,15 @@ export async function loadSaved(): Promise<Saved | null> {
   try {
     const project = await get<ProjectData>('project');
     if (!project) return null;
-    const audio: (Float32Array | null)[] = [];
-    for (let i = 0; i < 4; i++) audio.push((await get<Float32Array>(`audio${i}`)) ?? null);
-    return { project, audio, sampleRate: project.sampleRate };
+    // a loop is stored as one entry holding its channels; an older save held a bare mono Float32Array
+    const loops: (Loop | null)[] = [];
+    for (let i = 0; i < TRACKS; i++) {
+      const v = await get<Loop | Float32Array>(`audio${i}`);
+      loops.push(!v ? null : Array.isArray(v) ? v : [v]);
+    }
+    // a version-1 (four-track) save: its third track is not the Bounce track
+    if (project.v === 1) loops[TRACKS - 1] = null;
+    return { project, loops, sampleRate: project.sampleRate };
   } catch {
     return null;
   }
@@ -60,7 +66,7 @@ export async function loadSaved(): Promise<Saved | null> {
 
 export async function clearSaved(): Promise<void> {
   try {
-    await put([['project', undefined], ['audio0', undefined], ['audio1', undefined], ['audio2', undefined], ['audio3', undefined]]);
+    await put([['project', undefined], ...Array.from({ length: 4 }, (_, i): [string, unknown] => [`audio${i}`, undefined])]);
   } catch {
     /* nothing to clear */
   }
@@ -71,7 +77,7 @@ export function attachAutosave(engine: Engine, delayMs = 900) {
   let timer = 0;
   const flush = async () => {
     const entries: [string, unknown][] = [['project', engine.getProject()]];
-    for (const i of dirty) entries.push([`audio${i}`, engine.audio[i]]);
+    for (const i of dirty) entries.push([`audio${i}`, engine.loops[i]]);
     dirty.clear();
     try {
       await put(entries);

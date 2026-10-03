@@ -122,3 +122,17 @@ export function peakFreq(x: Float32Array, lo: number, hi: number, step: number, 
   }
   return best;
 }
+
+/** Power of one frequency (Goertzel), over the whole array. */
+export function bandPower(x: Float32Array, f: number, sr = 48000): number {
+  const w = (2 * Math.PI * f) / sr;
+  const c = 2 * Math.cos(w);
+  let s1 = 0;
+  let s2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const s = x[i] + c * s1 - s2;
+    s2 = s1;
+    s1 = s;
+  }
+  return (s1 * s1 + s2 * s2 - c * s1 * s2) / (x.length * x.length);
+}

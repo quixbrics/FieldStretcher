@@ -58,12 +58,16 @@ export class Wave {
     new ResizeObserver(() => this.draw()).observe(this.el);
   }
 
-  setPeaks(p: Float32Array | null, seconds: number) {
+  setEmptyText(text: string) {
+    this.empty.textContent = text;
+  }
+
+  setPeaks(p: Float32Array | null, seconds: number, start = 0, end = 1) {
     this.peaks = p;
     this.empty.hidden = !!p;
     this.el.classList.toggle('has-audio', !!p);
     this.minSpan = Math.min(0.5, 0.25 / Math.max(0.25, seconds));
-    this.setWindow(0, 1);
+    this.setWindow(start, end);
     this.draw();
   }
 

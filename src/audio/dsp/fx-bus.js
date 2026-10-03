@@ -181,6 +181,8 @@ class FxmReso extends FxBase {
   constructor(o) {
     super(o);
     this.lastNote = this.p.note;
+    // an offline render hands over the whole note list up front, as absolute frames
+    this.initialQueue = ((o && o.processorOptions && o.processorOptions.queue) || []).slice().sort((a, b) => a.frame - b.frame);
     this.reset();
   }
   reset() {
@@ -191,7 +193,7 @@ class FxmReso extends FxBase {
     this.dc = [new DCBlock(), new DCBlock()];
     this.freq = new Float64Array(8);
     this.pk = 0; // pluck burst level, decays in ~4 ms
-    this.queue = []; // timed notes from the sequencer
+    this.queue = this.initialQueue ? this.initialQueue.slice() : []; // timed notes from the sequencer
     this.envF = 0; // onset detector: fast and slow envelopes
     this.envS = 0;
     this.refract = 0;

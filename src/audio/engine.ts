@@ -1,33 +1,97 @@
 /*
- * The audio engine: one AudioContext, the microphone, four loop tracks and
- * the master chain.
+ * The audio engine: one AudioContext, the microphone, three loop tracks (two
+ * you record onto, plus the Bounce track that tracks are dubbed onto) and the
+ * master chain. The graph itself is built in graph.ts (shared with offline render).
  *
  *   mic ─► fs-capture (raw PCM, meter) ─► [taken when a track is armed]
- *
- *   track 1..4:  fxm-looper ─► mute ─┬─► level ─► pan ──────────┐
- *                                    └─► send ─► FX BUS ─► return ┴─► master ─► fxm-safety ─► out
- *
- *   FX BUS:  reso ─► delay ─► reverb, each blended dry/wet (equal power)
- *
- * The send is taken BEFORE the level fader, so turning a track's level down
- * while its send is up gives a wet-only sound. Mute and recording silence both.
+ *   master ─► fxm-safety ─► out ─► fs-tap (records the mix, or a dub onto Bounce)
  *
  * The context is created inside the first tap (iOS refuses otherwise), and the
  * mic request is fired in that same tap, in parallel with loading the DSP.
  */
 import { ensureWorklets, workletNode } from './worklets';
-import { MAX_SECONDS, computePeaks, concat, prepareLoop, repairSpeed, resampleTo, toMono } from './loopfx';
-import { Sequencer, type SeqSettings, type Step } from '../music/sequencer';
+import {
+  MAX_BOUNCE_SECONDS,
+  MAX_SECONDS,
+  computePeaks,
+  concat,
+  layerInto,
+  normalise,
+  peakOf,
+  prepareLoop,
+  repairSpeed,
+  resampleTo,
+  toMono,
+} from './loopfx';
+import { buildGraph, dryWet, type GraphInit, type GraphNodes, type TrackNodes } from './graph';
+import { Sequencer, planSequence, type SeqSettings, type Step } from '../music/sequencer';
 
-export const TRACKS = 4;
+/** Two tracks you record onto, and the Bounce track (index 2) that they are dubbed onto. */
+export const TRACKS = 3;
+export const MIC_TRACKS = 2;
+export const BOUNCE = 2;
 export type EngineKind = 'spectral' | 'granular' | 'tape';
-export type Quality = 'draft' | 'normal' | 'high';
-/** log2 of the FFT frame for Paulstretch: bigger = smoother, heavier. */
-const WINDOW: Record<Quality, number> = { draft: 12, normal: 13, high: 14 };
+/** A loop is one channel (a mic take) or two (the Bounce track keeps the stereo image). */
+export type Loop = Float32Array[];
+
+export const trackName = (i: number): string => (i === BOUNCE ? 'Bounce' : `Track ${i + 1}`);
+
+/** Per-mode sound controls. Each mode keeps its own, so switching modes never loses a setting. */
+export interface TapeSound {
+  /** slow speed drift 0–1 */
+  wow: number;
+  /** fast speed wobble 0–1 */
+  flutter: number;
+  /** tape saturation 0–1 */
+  drive: number;
+  /** high-frequency loss 0–1 */
+  age: number;
+  /** tape noise 0–1 */
+  hiss: number;
+}
+export interface SpectralSound {
+  /** log2 of the FFT frame (11–15): small = soft and quick, large = fine detail and slow */
+  window: number;
+  /** stereo width of the random phases 0–1 */
+  spread: number;
+  /** −1 dark … +1 bright */
+  tilt: number;
+  /** 0 diffuse … 0.5 as the source … 1 tonal */
+  focus: number;
+}
+export interface GranularSound {
+  /** ms */
+  grain: number;
+  /** grains per second */
+  density: number;
+  /** position scatter 0–1 */
+  jitter: number;
+  /** pitch scatter, semitones */
+  spray: number;
+  spread: number;
+  /** 0 percussive … 1 smooth */
+  shape: number;
+  /** chance a grain plays backwards 0–1 */
+  grev: number;
+}
+export interface SoundState {
+  tape: TapeSound;
+  spectral: SpectralSound;
+  granular: GranularSound;
+}
+export const defaultSound = (): SoundState => ({
+  tape: { wow: 0, flutter: 0, drive: 0, age: 0, hiss: 0 },
+  spectral: { window: 13, spread: 0.6, tilt: 0, focus: 0.5 },
+  granular: { grain: 120, density: 24, jitter: 0.2, spray: 0, spread: 0.6, shape: 1, grev: 0 },
+});
+/** the Focus slider (0–1, middle = unchanged) → the spectrum power law the DSP uses */
+export const focusToContrast = (f: number): number => (f < 0.5 ? 0.5 + f : 1 + (f - 0.5) * 3);
 
 export interface TrackState {
   engine: EngineKind;
   stretch: number;
+  /** seconds a stretch change takes to arrive (0 = instant); on tape it is the motor's inertia */
+  glide: number;
   pitch: number;
   reverse: boolean;
   freeze: boolean;
@@ -38,6 +102,11 @@ export interface TrackState {
   mute: boolean;
   /** FX bus send, 0–1 (taken before the level fader) */
   send: number;
+  /** recording layers over the loop instead of replacing it */
+  overdub: boolean;
+  /** how much of the old loop survives an overdub / dub (1 = all of it) */
+  keep: number;
+  sound: SoundState;
   /** length of the loop in seconds; 0 = empty */
   seconds: number;
 }
@@ -92,10 +161,10 @@ export const noteOf = (root: number, octave: number): number => 12 * (octave + 1
 /** What a saved project holds (the audio is stored beside it). */
 export interface ProjectData {
   app: 'FieldStretcher';
-  v: 1;
+  /** 1 = the four-track version */
+  v: 1 | 2;
   sampleRate: number;
   masterLevel: number;
-  quality: Quality;
   tracks: Omit<TrackState, 'seconds'>[];
   fx: FxState;
   seq: SeqSettings & { rate: number };
@@ -130,20 +199,11 @@ const defaultFx = (): FxState => ({
   level: 0.8,
 });
 
-/** equal-power dry/wet gains for a 0–1 mix */
-const dryWet = (mix: number) => ({ dry: Math.cos((mix * Math.PI) / 2), wet: Math.sin((mix * Math.PI) / 2) });
-
-interface Stage {
-  input: GainNode;
-  output: GainNode;
-  dry: GainNode;
-  wet: GainNode;
-  node: AudioWorkletNode;
-}
 
 export interface EngineEvents {
   level(peak: number): void;
-  pos(track: number, v: number): void;
+  /** playhead (0–1 of the loop) and the real speed it is moving at (1 = normal, negative = reverse) */
+  pos(track: number, v: number, rate: number): void;
   limiter(grDb: number, peakDb: number): void;
   ctxState(state: string): void;
   recTime(track: number, seconds: number): void;
@@ -157,75 +217,115 @@ export interface EngineEvents {
   bounceTime(seconds: number): void;
   /** mix recording hit its length limit */
   bounceAutoStop(): void;
+  /** dub progress, seconds */
+  dubTime(seconds: number): void;
+  /** a dub hit the Bounce track's length limit */
+  dubAutoStop(): void;
+  /** granular grains just spawned: [position 0–1, length 0–1, pan, semitones, direction ±1] */
+  grains(track: number, grains: number[][]): void;
 }
 
-/** A starting point: settings only, applied over the current tracks. */
+type SceneSound = { tape?: Partial<TapeSound>; spectral?: Partial<SpectralSound>; granular?: Partial<GranularSound> };
+export type SceneTrack = Partial<Omit<TrackState, 'seconds' | 'start' | 'end' | 'sound'>> & { sound?: SceneSound };
+
+/** A starting point: settings only, applied over the current tracks (the recordings stay). */
 export interface Scene {
   name: string;
   blurb: string;
-  tracks: Partial<Omit<TrackState, 'seconds' | 'start' | 'end'>>[];
+  tracks: SceneTrack[];
   fx: { reso?: Partial<ResoState>; delay?: Partial<DelayState>; reverb?: Partial<ReverbState>; level?: number };
   seq?: Partial<SeqSettings & { rate: number }>;
   seqOn?: boolean;
+  /** saved by the user (can be deleted) */
+  user?: boolean;
 }
 
-export type RecResult = { ok: true } | { ok: false; reason: 'short' | 'quiet' | 'idle' };
+export type RecResult = { ok: true } | { ok: false; reason: 'short' | 'quiet' | 'idle' | 'busy' };
 
-/** Every track starts as a plain loop at normal speed (tape at 1×); stretching is opt-in. */
-const DEFAULTS: Pick<TrackState, 'engine' | 'stretch'>[] = Array.from({ length: 4 }, () => ({ engine: 'tape' as EngineKind, stretch: 1 }));
+/** Every track starts as a plain loop at normal speed (tape at 1×), with nothing sent to the FX. */
+const defaultTrack = (): TrackState => ({
+  engine: 'tape',
+  stretch: 1,
+  glide: 0,
+  pitch: 0,
+  reverse: false,
+  freeze: false,
+  start: 0,
+  end: 1,
+  level: 0.8,
+  pan: 0,
+  mute: false,
+  send: 0,
+  overdub: false,
+  keep: 1,
+  sound: defaultSound(),
+  seconds: 0,
+});
 
-interface TrackNodes {
-  looper: AudioWorkletNode;
-  /** mute / recording silence — before both the dry path and the send */
-  mute: GainNode;
-  gain: GainNode;
-  pan: StereoPannerNode;
-  send: GainNode;
+const mergeSound = (base: SoundState, patch: SceneSound | undefined): SoundState => ({
+  tape: { ...base.tape, ...patch?.tape },
+  spectral: { ...base.spectral, ...patch?.spectral },
+  granular: { ...base.granular, ...patch?.granular },
+});
+
+/** Read a sound block from a saved file: anything missing or out of range falls back to the default. */
+function readSound(src: unknown): SoundState {
+  const d = defaultSound();
+  const s = (src ?? {}) as { tape?: Partial<TapeSound>; spectral?: Partial<SpectralSound>; granular?: Partial<GranularSound> };
+  const t = s.tape ?? {};
+  const sp = s.spectral ?? {};
+  const g = s.granular ?? {};
+  return {
+    tape: { wow: num(t.wow, 0, 1, d.tape.wow), flutter: num(t.flutter, 0, 1, d.tape.flutter), drive: num(t.drive, 0, 1, d.tape.drive), age: num(t.age, 0, 1, d.tape.age), hiss: num(t.hiss, 0, 1, d.tape.hiss) },
+    spectral: { window: Math.round(num(sp.window, 11, 15, d.spectral.window)), spread: num(sp.spread, 0, 1, d.spectral.spread), tilt: num(sp.tilt, -1, 1, d.spectral.tilt), focus: num(sp.focus, 0, 1, d.spectral.focus) },
+    granular: {
+      grain: num(g.grain, 10, 1000, d.granular.grain),
+      density: num(g.density, 1, 200, d.granular.density),
+      jitter: num(g.jitter, 0, 1, d.granular.jitter),
+      spray: num(g.spray, 0, 12, d.granular.spray),
+      spread: num(g.spread, 0, 1, d.granular.spread),
+      shape: num(g.shape, 0, 1, d.granular.shape),
+      grev: num(g.grev, 0, 1, d.granular.grev),
+    },
+  };
 }
 
 type AudioSessionNav = Navigator & { audioSession?: { type: string } };
+type Wake = { release(): Promise<void> };
 
 export class Engine {
   ctx: AudioContext | null = null;
   events: Partial<EngineEvents> = {};
-  tracks: TrackState[] = DEFAULTS.map((d) => ({
-    ...d,
-    pitch: 0,
-    reverse: false,
-    freeze: false,
-    start: 0,
-    end: 1,
-    level: 0.8,
-    pan: 0,
-    mute: false,
-    send: 0.3,
-    seconds: 0,
-  }));
+  tracks: TrackState[] = Array.from({ length: TRACKS }, defaultTrack);
   fx: FxState = defaultFx();
   seq: SeqState = { on: false, rate: 3 };
   sequencer = new Sequencer({ scale: 'dorian', motion: 'drift', range: 2, chance: 0.85, chordSize: 0, seed: 1 });
   /** waveform peaks per track (null = empty) */
   peaks: (Float32Array | null)[] = Array(TRACKS).fill(null);
-  /** the loop audio itself (mono), kept for export and redraw */
-  audio: (Float32Array | null)[] = Array(TRACKS).fill(null);
+  /** the loop audio itself (1 channel, or 2 on the Bounce track), kept for export, redraw and layering */
+  loops: (Loop | null)[] = Array(TRACKS).fill(null);
+  /** last reported playhead per track, 0–1 (where an overdub or a dub lands) */
+  lastPos: number[] = Array(TRACKS).fill(0);
   playing = true;
-  quality: Quality = 'normal';
   masterLevel = 0.85;
   micError: string | null = null;
   recTrack = -1;
+  /** the track being dubbed onto Bounce, or -1 */
+  dubSource = -1;
+  bouncing = false;
+  /** audio-path facts for the Settings sheet */
+  diag: { ctxRate: number; micRate: number | null; take: TakeInfo | null } = { ctxRate: 0, micRate: null, take: null };
 
-  private nodes: TrackNodes[] = [];
-  private master!: GainNode;
-  private busIn!: GainNode;
-  private busOut!: GainNode;
-  private stages!: { reso: Stage; delay: Stage; reverb: Stage };
-  private safety!: AudioWorkletNode;
+  private g: GraphNodes | null = null;
   private capture: AudioWorkletNode | null = null;
   private stream: MediaStream | null = null;
   private chunks: Float32Array[] = [];
   private recSamples = 0;
   private recDone: (() => void) | null = null;
-  private wake: { release(): Promise<void> } | null = null;
+  private recOverdub = false;
+  private recOffset = 0;
+  private recWall0 = 0;
+  private wake: Wake | null = null;
   private starting: Promise<void> | null = null;
   private seqTimer = 0;
   private seqNext = 0;
@@ -235,14 +335,11 @@ export class Engine {
   private seqLog: { at: number; step: Step }[] = [];
   private fxListeners = new Set<() => void>();
   private changeListeners = new Set<(audioTrack?: number) => void>();
-  private recWall0 = 0;
   private tap: AudioWorkletNode | null = null;
-  private bounceChunks: { l: Float32Array; r: Float32Array }[] = [];
-  private bounceSamples = 0;
-  private bounceDone: (() => void) | null = null;
-  bouncing = false;
-  /** audio-path facts for the Settings sheet */
-  diag: { ctxRate: number; micRate: number | null; take: TakeInfo | null } = { ctxRate: 0, micRate: null, take: null };
+  private tapChunks: { l: Float32Array; r: Float32Array }[] = [];
+  private tapSamples = 0;
+  private tapDone: (() => void) | null = null;
+  private dubOffset = 0;
 
   /** Subscribe to any state change (autosave). `audioTrack` is set when that track's audio changed. */
   onChange(fn: (audioTrack?: number) => void): void {
@@ -255,9 +352,16 @@ export class Engine {
   clearUiListeners() {
     this.fxListeners.clear();
   }
+  /** UI hook: runs whenever any FX/sequencer value changes (to keep duplicate controls in step). */
+  onFxChange(fn: () => void): void {
+    this.fxListeners.add(fn);
+  }
+  private fxChanged() {
+    for (const l of this.fxListeners) l();
+  }
 
   get started(): boolean {
-    return this.nodes.length > 0;
+    return this.g !== null;
   }
   get sampleRate(): number {
     return this.ctx?.sampleRate ?? 48000;
@@ -268,6 +372,9 @@ export class Engine {
   }
   get hasMic(): boolean {
     return this.capture !== null;
+  }
+  get dubbing(): boolean {
+    return this.dubSource >= 0;
   }
 
   /** Must be called from a tap. Safe to call again (e.g. to resume). */
@@ -288,35 +395,18 @@ export class Engine {
     const micP = this.askMic();
     await ensureWorklets(ctx);
 
-    this.master = ctx.createGain();
-    this.master.gain.value = this.masterLevel ** 2;
-    this.safety = workletNode(ctx, 'fxm-safety', { params: { ceiling: -1 }, report: true });
-    this.safety.port.onmessage = (e) => {
-      const m = e.data;
-      if (m.type === 'meter') this.events.limiter?.(m.gr, m.peak);
-      else if (m.type === 'blowup') this.events.blowup?.();
-    };
-    this.master.connect(this.safety).connect(ctx.destination);
-
-    this.buildBus(ctx);
-
-    for (let i = 0; i < TRACKS; i++) {
-      const t = this.tracks[i];
-      const looper = workletNode(ctx, 'fxm-looper', { params: this.looperParams(t), seed: 1000 + i, report: true }, 0);
-      looper.port.onmessage = (e) => {
-        if (e.data.type === 'pos') this.events.pos?.(i, e.data.v);
-        else if (e.data.type === 'blowup') this.events.blowup?.();
-      };
-      const mute = ctx.createGain();
-      const gain = ctx.createGain();
-      const pan = ctx.createStereoPanner();
-      const send = ctx.createGain();
-      looper.connect(mute);
-      mute.connect(gain).connect(pan).connect(this.master);
-      mute.connect(send).connect(this.busIn);
-      this.nodes.push({ looper, mute, gain, pan, send });
-      this.applyMix(i);
-    }
+    this.g = buildGraph(ctx, this.graphInit({ live: true }), {
+      safety: (m) => {
+        if (m.type === 'meter') this.events.limiter?.(m.gr ?? 0, m.peak ?? 0);
+      },
+      looper: (i, m) => {
+        if (m.type === 'pos') {
+          this.lastPos[i] = m.v ?? 0;
+          this.events.pos?.(i, m.v ?? 0, m.r ?? 0);
+        } else if (m.type === 'grains') this.events.grains?.(i, m.g ?? []);
+      },
+      blowup: () => this.events.blowup?.(),
+    });
 
     const stream = await micP;
     if (stream) this.attachMic(stream, ctx);
@@ -326,36 +416,56 @@ export class Engine {
     });
   }
 
-  /** reso → delay → reverb, each stage blended dry/wet, into the return */
-  private buildBus(ctx: AudioContext) {
+  /* ------------------------------------------------------- graph state -- */
+
+  private muteGain(i: number): number {
+    const t = this.tracks[i];
+    if (this.dubSource >= 0) return i === this.dubSource ? 1 : 0; // a dub hears the source on its own
+    if (this.recTrack === i && !this.recOverdub) return 0; // a track being re-recorded goes quiet
+    return t.mute ? 0 : 1;
+  }
+
+  /**
+   * Everything the graph is built from. `live` = the playing graph; otherwise an
+   * offline render, in which every loop plays from the top and, if `solo` is set,
+   * only that track is heard (a stem).
+   */
+  private graphInit(o: { live: boolean; solo?: number | null; seconds?: number }): GraphInit {
     const fx = this.fx;
-    this.busIn = ctx.createGain();
-    this.busOut = ctx.createGain();
-    this.busOut.gain.value = fx.level ** 2;
-    const stage = (name: string, params: Record<string, number>, mix: number): Stage => {
-      const node = workletNode(ctx, name, { params, report: true }, 1);
-      node.port.onmessage = (e) => {
-        if (e.data.type === 'blowup') this.events.blowup?.();
-      };
-      const input = ctx.createGain();
-      const output = ctx.createGain();
-      const dry = ctx.createGain();
-      const wet = ctx.createGain();
-      const g = dryWet(mix);
-      dry.gain.value = g.dry;
-      wet.gain.value = g.wet;
-      input.connect(node).connect(wet).connect(output);
-      input.connect(dry).connect(output);
-      return { input, output, dry, wet, node };
+    const tonic = this.tonic();
+    const base = this.resoParams();
+    const reso: Record<string, number> = { ...base, note: base.note ?? tonic };
+    let resoQueue: unknown[] | undefined;
+    if (!o.live) {
+      if (this.seq.on) resoQueue = planSequence(this.sequencer.s, this.seq.rate, o.seconds ?? 30, tonic, this.sampleRate);
+      else if (this.manualNote) reso.note = tonic + this.sequencer.describe(this.sequencer.index).semis;
+    }
+    return {
+      tracks: this.tracks.map((t, i) => ({
+        params: this.looperParams(t, !o.live, o.live ? t.seconds > 0 : !!this.loops[i]),
+        audio: o.live ? null : this.loops[i],
+        seed: 1000 + i,
+        mute: o.live ? this.muteGain(i) : o.solo === undefined || o.solo === null ? (t.mute ? 0 : 1) : i === o.solo ? 1 : 0,
+        gain: t.level ** 2,
+        pan: t.pan,
+        send: t.send ** 2,
+      })),
+      fx: {
+        reso,
+        delay: this.delayParams(),
+        reverb: this.reverbParams(),
+        mix: { reso: fx.reso.mix, delay: fx.delay.mix, reverb: fx.reverb.mix },
+        level: fx.level ** 2,
+      },
+      master: this.masterLevel ** 2,
+      resoQueue,
+      report: o.live,
     };
-    const reso = stage('fxm-reso', this.resoParams(), fx.reso.mix);
-    const delay = stage('fxm-delay', this.delayParams(), fx.delay.mix);
-    const reverb = stage('fxm-fdn', this.reverbParams(), fx.reverb.mix);
-    this.busIn.connect(reso.input);
-    reso.output.connect(delay.input);
-    delay.output.connect(reverb.input);
-    reverb.output.connect(this.busOut).connect(this.master);
-    this.stages = { reso, delay, reverb };
+  }
+
+  /** The graph for an offline render: everything as it is now, loops starting from the top. */
+  renderInit(seconds: number, solo: number | null): GraphInit {
+    return this.graphInit({ live: false, solo, seconds });
   }
 
   private resoParams() {
@@ -384,44 +494,77 @@ export class Engine {
     return { size: r.size, decay: r.decay, damping: r.damping, shimmer: r.shimmer, freeze: r.freeze ? 1 : 0 };
   }
 
+  private looperParams(t: TrackState, forcePlaying = false, hasAudio = t.seconds > 0): Record<string, number | string> {
+    const s = t.sound;
+    return {
+      engine: t.engine,
+      stretch: t.stretch,
+      glide: t.glide,
+      pitch: t.pitch,
+      reverse: t.reverse ? 1 : 0,
+      freeze: t.freeze ? 1 : 0,
+      start: t.start,
+      end: t.end,
+      playing: (forcePlaying || this.playing) && hasAudio ? 1 : 0,
+      // tape
+      wow: s.tape.wow,
+      flutter: s.tape.flutter,
+      drive: s.tape.drive,
+      age: s.tape.age,
+      hiss: s.tape.hiss,
+      // spectral and granular both use `spread`; send the one for the mode in use
+      window: s.spectral.window,
+      tilt: s.spectral.tilt,
+      contrast: focusToContrast(s.spectral.focus),
+      spread: t.engine === 'granular' ? s.granular.spread : s.spectral.spread,
+      // granular
+      grain: s.granular.grain,
+      density: s.granular.density,
+      jitter: s.granular.jitter,
+      spray: s.granular.spray,
+      shape: s.granular.shape,
+      grev: s.granular.grev,
+    };
+  }
+
   updateFx<K extends 'reso' | 'delay' | 'reverb'>(section: K, patch: Partial<FxState[K]>) {
     Object.assign(this.fx[section], patch);
     this.touch();
-    for (const l of this.fxListeners) l();
+    this.fxChanged();
     if (section === 'reso' && ('root' in patch || 'octave' in patch)) {
       this.manualNote = false;
       if (this.seq.on) this.seqReschedule(true);
     }
-    if (!this.ctx || !this.stages) return;
-    const st = this.stages[section];
+    if (!this.ctx || !this.g) return;
+    const st = this.g.stages[section];
     const params = section === 'reso' ? this.resoParams() : section === 'delay' ? this.delayParams() : this.reverbParams();
     st.node.port.postMessage({ type: 'params', params });
     if ('mix' in patch) {
-      const g = dryWet(this.fx[section].mix);
-      st.dry.gain.setTargetAtTime(g.dry, this.ctx.currentTime, 0.03);
-      st.wet.gain.setTargetAtTime(g.wet, this.ctx.currentTime, 0.03);
+      const w = dryWet(this.fx[section].mix);
+      st.dry.gain.setTargetAtTime(w.dry, this.ctx.currentTime, 0.03);
+      st.wet.gain.setTargetAtTime(w.wet, this.ctx.currentTime, 0.03);
     }
   }
 
   setFxLevel(v: number) {
     this.fx.level = v;
     this.touch();
-    if (this.ctx) this.busOut.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
+    if (this.ctx && this.g) this.g.busOut.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
   }
 
   /* ---------------------------------------------------------- sequencer -- */
 
-  /** UI hook: runs whenever any FX/sequencer value changes (to keep duplicate controls in step). */
-  onFxChange(fn: () => void): void {
-    this.fxListeners.add(fn);
+  private resoNode(): AudioWorkletNode | null {
+    return this.g?.stages.reso.node ?? null;
   }
 
   setSeqOn(on: boolean) {
     this.seq.on = on;
     this.manualNote = false;
-    if (!this.ctx || !this.stages) return;
+    const reso = this.resoNode();
+    if (!this.ctx || !reso) return;
     window.clearInterval(this.seqTimer);
-    this.stages.reso.node.port.postMessage({ type: 'clear' });
+    reso.port.postMessage({ type: 'clear' });
     this.seqLog = [];
     if (on) {
       // sound the current note first, then step on from there
@@ -433,10 +576,10 @@ export class Engine {
       this.seqTick();
     } else {
       // back to the Key setting (and the chord shape), gliding there
-      this.stages.reso.node.port.postMessage({ type: 'chord' });
-      this.stages.reso.node.port.postMessage({ type: 'params', params: this.resoParams() });
+      reso.port.postMessage({ type: 'chord' });
+      reso.port.postMessage({ type: 'params', params: this.resoParams() });
     }
-    for (const l of this.fxListeners) l();
+    this.fxChanged();
   }
 
   updateSeq(patch: Partial<SeqSettings> & { rate?: number }) {
@@ -445,36 +588,38 @@ export class Engine {
     Object.assign(this.sequencer.s, settings);
     this.touch();
     if (patch.range !== undefined || patch.scale !== undefined) this.sequencer.set(Math.min(this.sequencer.index, this.sequencer.max));
-    for (const l of this.fxListeners) l();
+    this.fxChanged();
     if (this.seq.on) this.seqReschedule(patch.scale !== undefined || patch.chordSize !== undefined || patch.range !== undefined);
-    else if (patch.chordSize !== undefined && this.stages && this.manualNote) this.seqSet(this.sequencer.index);
+    else if (patch.chordSize !== undefined && this.g && this.manualNote) this.seqSet(this.sequencer.index);
   }
 
   /** a new seed: a new line, from the tonic */
   reseed(seed = Math.floor(Math.random() * 1e6)) {
     this.sequencer.reseed(seed);
     this.touch();
-    for (const l of this.fxListeners) l();
+    this.fxChanged();
     if (this.seq.on) this.seqReschedule(true);
   }
 
   /** Play a scale note now (a tapped note); it holds until the sequencer moves on. */
   seqSet(index: number) {
-    if (!this.ctx || !this.stages) return;
+    const reso = this.resoNode();
+    if (!this.ctx || !reso) return;
     const step = this.sequencer.set(index);
     if (!this.seq.on) {
       this.manualNote = true;
-      this.stages.reso.node.port.postMessage({ type: 'params', params: this.resoParams() });
+      reso.port.postMessage({ type: 'params', params: this.resoParams() });
     } else this.seqReschedule(false);
     this.sendStep(step, this.ctx.currentTime + 0.02, 0);
-    for (const l of this.fxListeners) l();
+    this.fxChanged();
   }
 
   /** Drop what is queued and re-plan from the current settings. `replay` re-sounds the current note. */
   private seqReschedule(replay: boolean) {
-    if (!this.ctx || !this.stages) return;
+    const reso = this.resoNode();
+    if (!this.ctx || !reso) return;
     const now = this.ctx.currentTime;
-    this.stages.reso.node.port.postMessage({ type: 'clear' });
+    reso.port.postMessage({ type: 'clear' });
     this.seqLog = this.seqLog.filter((e) => e.at <= now);
     this.seqNext = Math.max(now + 0.05, this.seqLast + this.seq.rate);
     if (replay) {
@@ -499,8 +644,9 @@ export class Engine {
   }
 
   private sendStep(step: Step, at: number, pluck: number) {
-    if (!this.ctx || !this.stages) return;
-    this.stages.reso.node.port.postMessage({
+    const reso = this.resoNode();
+    if (!this.ctx || !reso) return;
+    reso.port.postMessage({
       type: 'note',
       frame: Math.round(at * this.ctx.sampleRate),
       note: this.tonic() + step.semis,
@@ -518,6 +664,8 @@ export class Engine {
     for (const e of this.seqLog) if (e.at <= now) cur = e.step;
     return cur;
   }
+
+  /* --------------------------------------------------------------- mic -- */
 
   private async askMic(): Promise<MediaStream | null> {
     try {
@@ -565,13 +713,18 @@ export class Engine {
 
   /* ------------------------------------------------------------ record -- */
 
+  /** Record the mic onto a track. With Overdub on (and something already there) it layers over the loop instead of replacing it. */
   startRecording(track: number): boolean {
-    if (!this.capture || this.recTrack >= 0) return false;
+    if (!this.capture || this.recTrack >= 0 || this.dubSource >= 0 || track >= MIC_TRACKS) return false;
     this.chunks = [];
     this.recSamples = 0;
     this.recTrack = track;
     this.recWall0 = performance.now();
-    this.applyMix(track); // a track that is being re-recorded goes quiet
+    const loop = this.loops[track];
+    this.recOverdub = this.tracks[track].overdub && !!loop;
+    // an overdub lands where the loop is now; the loop keeps playing underneath
+    this.recOffset = loop ? Math.floor(this.lastPos[track] * loop[0].length) : 0;
+    this.applyMix(track);
     this.capture.port.postMessage({ type: 'rec', on: true });
     if (!this.playing) this.setPlaying(true);
     return true;
@@ -597,7 +750,9 @@ export class Engine {
     this.capture.port.postMessage({ type: 'rec', on: false });
     await done;
     this.recDone = null;
+    const overdub = this.recOverdub;
     this.recTrack = -1;
+    this.recOverdub = false;
     let raw = concat(this.chunks);
     this.chunks = [];
     const sr = this.sampleRate;
@@ -607,119 +762,152 @@ export class Engine {
     this.diag.take = { heardSeconds: this.recSamples / sr, realSeconds: wall, repaired: fixed.ratio };
     const max = Math.floor(MAX_SECONDS * sr);
     if (raw.length > max) raw = raw.subarray(0, max);
-    const res = prepareLoop(raw, sr);
-    if (res.ok) this.setBuffer(t, res.data);
+    let result: RecResult;
+    const old = this.loops[t];
+    if (overdub && old) {
+      // layer the take over the loop at the playhead it started on
+      let mean = 0;
+      for (let i = 0; i < raw.length; i++) mean += raw[i];
+      mean /= Math.max(1, raw.length);
+      const layer = raw.map((v) => v - mean);
+      if (raw.length < 0.1 * sr) result = { ok: false, reason: 'short' };
+      else if (peakOf([layer]) < 0.001) result = { ok: false, reason: 'quiet' };
+      else {
+        const dst = old[0].slice();
+        layerInto(dst, layer, this.recOffset, this.tracks[t].keep);
+        this.setBuffer(t, [dst], true);
+        result = { ok: true };
+      }
+    } else {
+      const res = prepareLoop([raw], sr);
+      if (res.ok) {
+        this.setBuffer(t, res.chans);
+        result = { ok: true };
+      } else result = { ok: false, reason: res.reason };
+    }
     this.applyMix(t);
-    return res.ok ? { ok: true } : { ok: false, reason: res.reason };
+    return result;
   }
 
-  /** Put audio on a track. Resets the loop window; keeps stretch/pitch/etc. */
-  setBuffer(track: number, data: Float32Array) {
+  /**
+   * Put audio on a track. A new loop resets the loop window and restarts; `keep`
+   * swaps audio of the same length under the playing loop without restarting it
+   * (an overdub, a dub layered onto Bounce, a normalise).
+   */
+  setBuffer(track: number, chans: Loop, keep = false) {
     const t = this.tracks[track];
-    this.audio[track] = data;
-    this.peaks[track] = computePeaks(data, 320);
-    t.seconds = data.length / this.sampleRate;
-    t.start = 0;
-    t.end = 1;
-    const copy = data.slice();
-    this.nodes[track].looper.port.postMessage({ type: 'buffer', channels: [copy] }, [copy.buffer]);
-    this.update(track, { start: 0, end: 1 });
+    const same = keep && this.loops[track] && this.loops[track]![0].length === chans[0].length;
+    this.loops[track] = chans;
+    this.peaks[track] = computePeaks(chans, 320);
+    t.seconds = chans[0].length / this.sampleRate;
+    if (!same) {
+      t.start = 0;
+      t.end = 1;
+    }
+    const copies = chans.map((c) => c.slice());
+    this.g?.tracks[track].looper.port.postMessage({ type: 'buffer', channels: copies, keep: !!same }, copies.map((c) => c.buffer));
+    this.update(track, same ? {} : { start: 0, end: 1 });
     this.events.track?.(track);
     this.touch(track);
   }
 
   clearTrack(track: number) {
-    this.audio[track] = null;
+    this.loops[track] = null;
     this.peaks[track] = null;
     this.tracks[track].seconds = 0;
-    this.nodes[track]?.looper.port.postMessage({ type: 'buffer', channels: [] });
+    this.g?.tracks[track]?.looper.port.postMessage({ type: 'buffer', channels: [] });
     this.events.track?.(track);
     this.touch(track);
+  }
+
+  /** Bring a quiet recording up to −3 dBFS. Never done automatically. */
+  normaliseTrack(track: number): { ok: true; gainDb: number } | { ok: false; reason: 'empty' | 'quiet' } {
+    const loop = this.loops[track];
+    if (!loop) return { ok: false, reason: 'empty' };
+    const r = normalise(loop);
+    if (!r.ok) return { ok: false, reason: 'quiet' };
+    this.setBuffer(track, r.chans, true);
+    return { ok: true, gainDb: r.gainDb };
   }
 
   async importFile(track: number, file: File): Promise<RecResult> {
     if (!this.ctx) return { ok: false, reason: 'idle' };
     const decoded = await this.ctx.decodeAudioData(await file.arrayBuffer());
-    const chans = Array.from({ length: decoded.numberOfChannels }, (_, c) => decoded.getChannelData(c));
-    let mono = toMono(chans);
-    const max = Math.floor(MAX_SECONDS * decoded.sampleRate);
-    if (mono.length > max) mono = mono.slice(0, max);
-    const res = prepareLoop(mono, decoded.sampleRate);
+    const all = Array.from({ length: decoded.numberOfChannels }, (_, c) => decoded.getChannelData(c));
+    // the Bounce track keeps a stereo image; the mic tracks are mono
+    let chans: Loop = track === BOUNCE && all.length >= 2 ? [all[0], all[1]] : [toMono(all)];
+    const max = Math.floor((track === BOUNCE ? MAX_BOUNCE_SECONDS : MAX_SECONDS) * decoded.sampleRate);
+    if (chans[0].length > max) chans = chans.map((c) => c.slice(0, max));
+    if (decoded.sampleRate !== this.sampleRate) chans = chans.map((c) => resampleTo(c, Math.round((c.length * this.sampleRate) / decoded.sampleRate)));
+    const res = prepareLoop(chans, this.sampleRate);
     if (!res.ok) return { ok: false, reason: res.reason };
-    this.setBuffer(track, res.data);
+    this.setBuffer(track, res.chans);
     if (!this.playing) this.setPlaying(true);
     return { ok: true };
   }
 
   /* ------------------------------------------------------------- params -- */
 
-  private looperParams(t: TrackState) {
-    return {
-      engine: t.engine,
-      stretch: t.stretch,
-      pitch: t.pitch,
-      reverse: t.reverse ? 1 : 0,
-      freeze: t.freeze ? 1 : 0,
-      start: t.start,
-      end: t.end,
-      window: WINDOW[this.quality],
-      playing: this.playing && t.seconds > 0 ? 1 : 0,
-    };
-  }
-
-  update(track: number, patch: Partial<TrackState>) {
+  update(track: number, patch: Partial<Omit<TrackState, 'sound'>>) {
     const t = this.tracks[track];
     Object.assign(t, patch);
     this.touch();
-    const n = this.nodes[track];
+    const n = this.g?.tracks[track];
     if (!n) return;
     n.looper.port.postMessage({ type: 'params', params: this.looperParams(t) });
     if ('level' in patch || 'mute' in patch || 'send' in patch) this.applyMix(track);
     if ('pan' in patch) n.pan.pan.setTargetAtTime(t.pan, this.ctx!.currentTime, 0.02);
   }
 
+  /** A mode's own controls (the track keeps one set per mode). */
+  updateSound<K extends keyof SoundState>(track: number, kind: K, patch: Partial<SoundState[K]>) {
+    const t = this.tracks[track];
+    Object.assign(t.sound[kind], patch);
+    this.touch();
+    this.g?.tracks[track]?.looper.port.postMessage({ type: 'params', params: this.looperParams(t) });
+  }
+
   private applyMix(track: number) {
     const t = this.tracks[track];
-    const n = this.nodes[track];
+    const n: TrackNodes | undefined = this.g?.tracks[track];
     if (!n || !this.ctx) return;
     const now = this.ctx.currentTime;
-    n.mute.gain.setTargetAtTime(t.mute || this.recTrack === track ? 0 : 1, now, 0.02);
+    n.mute.gain.setTargetAtTime(this.muteGain(track), now, 0.02);
     n.gain.gain.setTargetAtTime(t.level * t.level, now, 0.02);
     n.send.gain.setTargetAtTime(t.send * t.send, now, 0.02);
+  }
+
+  private applyAllMix() {
+    for (let i = 0; i < TRACKS; i++) this.applyMix(i);
   }
 
   setMaster(v: number) {
     this.masterLevel = v;
     this.touch();
-    if (this.ctx) this.master.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
-  }
-
-  setQuality(q: Quality) {
-    this.quality = q;
-    this.touch();
-    for (let i = 0; i < TRACKS; i++) this.update(i, {});
+    if (this.ctx && this.g) this.g.master.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
   }
 
   setPlaying(on: boolean) {
     this.playing = on;
     for (let i = 0; i < TRACKS; i++) {
       this.update(i, {});
-      if (on && this.tracks[i].seconds > 0) this.nodes[i]?.looper.port.postMessage({ type: 'play' });
+      if (on && this.tracks[i].seconds > 0) this.g?.tracks[i].looper.port.postMessage({ type: 'play' });
     }
     void this.holdScreen(on);
   }
 
   /** Reset every processor (the "panic" button). */
   panic() {
-    for (const n of this.nodes) n.looper.port.postMessage({ type: 'reset' });
-    this.safety?.port.postMessage({ type: 'reset' });
-    if (this.stages) for (const st of Object.values(this.stages)) st.node.port.postMessage({ type: 'reset' });
+    if (!this.g) return;
+    for (const n of this.g.tracks) n.looper.port.postMessage({ type: 'reset' });
+    this.g.safety.port.postMessage({ type: 'reset' });
+    for (const st of Object.values(this.g.stages)) st.node.port.postMessage({ type: 'reset' });
   }
 
   /** Keep the screen (and so the audio) awake while playing. */
   private async holdScreen(on: boolean) {
     try {
-      const wl = (navigator as Navigator & { wakeLock?: { request(t: 'screen'): Promise<{ release(): Promise<void> }> } }).wakeLock;
+      const wl = (navigator as Navigator & { wakeLock?: { request(t: 'screen'): Promise<Wake> } }).wakeLock;
       if (on && wl && !this.wake) this.wake = await wl.request('screen');
       else if (!on && this.wake) {
         await this.wake.release();
@@ -730,48 +918,121 @@ export class Engine {
     }
   }
 
+  /* ------------------------------------------- the output tap: mix, dub -- */
 
-  /* ----------------------------------------------------------- mix out -- */
-
-  /** Start recording what comes out of the speakers (after the limiter). */
-  startBounce(): boolean {
-    if (!this.ctx || !this.started || this.bouncing) return false;
+  private ensureTap(): AudioWorkletNode | null {
+    if (!this.ctx || !this.g) return null;
     if (!this.tap) {
       this.tap = workletNode(this.ctx, 'fs-tap', {}, 1);
       this.tap.port.onmessage = (e) => {
         const m = e.data;
         if (m.type === 'chunk') {
-          this.bounceChunks.push({ l: m.l, r: m.r });
-          this.bounceSamples += m.l.length;
-          this.events.bounceTime?.(this.bounceSamples / this.sampleRate);
-          if (this.bounceSamples >= MAX_MIX_SECONDS * this.sampleRate) this.events.bounceAutoStop?.();
-        } else if (m.type === 'recStopped') this.bounceDone?.();
+          this.tapChunks.push({ l: m.l, r: m.r });
+          this.tapSamples += m.l.length;
+          const sec = this.tapSamples / this.sampleRate;
+          if (this.dubSource >= 0) {
+            this.events.dubTime?.(sec);
+            if (sec >= MAX_BOUNCE_SECONDS) this.events.dubAutoStop?.();
+          } else {
+            this.events.bounceTime?.(sec);
+            if (sec >= MAX_MIX_SECONDS) this.events.bounceAutoStop?.();
+          }
+        } else if (m.type === 'recStopped') this.tapDone?.();
       };
       const silent = this.ctx.createGain();
       silent.gain.value = 0;
-      this.safety.connect(this.tap).connect(silent).connect(this.ctx.destination);
+      this.g.safety.connect(this.tap).connect(silent).connect(this.ctx.destination);
     }
-    this.bounceChunks = [];
-    this.bounceSamples = 0;
-    this.bouncing = true;
-    this.tap.port.postMessage({ type: 'rec', on: true });
+    return this.tap;
+  }
+
+  private tapStart(): boolean {
+    const tap = this.ensureTap();
+    if (!tap) return false;
+    this.tapChunks = [];
+    this.tapSamples = 0;
+    tap.port.postMessage({ type: 'rec', on: true });
     return true;
   }
 
-  async stopBounce(): Promise<{ l: Float32Array; r: Float32Array; sampleRate: number } | null> {
-    if (!this.bouncing || !this.tap) return null;
+  private async tapStop(): Promise<{ l: Float32Array; r: Float32Array } | null> {
+    if (!this.tap) return null;
     const done = new Promise<void>((res) => {
-      this.bounceDone = res;
+      this.tapDone = res;
       setTimeout(res, 600);
     });
     this.tap.port.postMessage({ type: 'rec', on: false });
     await done;
-    this.bounceDone = null;
+    this.tapDone = null;
+    const l = concat(this.tapChunks.map((c) => c.l));
+    const r = concat(this.tapChunks.map((c) => c.r));
+    this.tapChunks = [];
+    return l.length ? { l, r } : null;
+  }
+
+  /** Start recording what comes out of the speakers (after the limiter). */
+  startBounce(): boolean {
+    if (!this.started || this.bouncing || this.dubSource >= 0) return false;
+    if (!this.tapStart()) return false;
+    this.bouncing = true;
+    return true;
+  }
+
+  async stopBounce(): Promise<{ l: Float32Array; r: Float32Array; sampleRate: number } | null> {
+    if (!this.bouncing) return null;
+    const out = await this.tapStop();
     this.bouncing = false;
-    const l = concat(this.bounceChunks.map((c) => c.l));
-    const r = concat(this.bounceChunks.map((c) => c.r));
-    this.bounceChunks = [];
-    return l.length ? { l, r, sampleRate: this.sampleRate } : null;
+    return out ? { ...out, sampleRate: this.sampleRate } : null;
+  }
+
+  /**
+   * Dub a track onto the Bounce track. The source plays on its own (stretch, pitch,
+   * its FX send and the tails of the FX bus) and what comes out is recorded. The first
+   * dub becomes the Bounce loop; later dubs are layered onto it from the loop position
+   * where they began, the old audio kept by the Bounce track's "keep" amount.
+   */
+  startDub(source: number): boolean {
+    if (!this.started || source >= MIC_TRACKS || !this.loops[source] || this.dubSource >= 0 || this.bouncing || this.recTrack >= 0) return false;
+    const old = this.loops[BOUNCE];
+    this.dubOffset = old ? Math.floor(this.lastPos[BOUNCE] * old[0].length) : 0;
+    this.dubSource = source;
+    this.applyAllMix();
+    if (!this.playing) this.setPlaying(true);
+    if (!this.tapStart()) {
+      this.dubSource = -1;
+      this.applyAllMix();
+      return false;
+    }
+    return true;
+  }
+
+  async stopDub(): Promise<RecResult> {
+    if (this.dubSource < 0) return { ok: false, reason: 'idle' };
+    const out = await this.tapStop();
+    this.dubSource = -1;
+    this.applyAllMix();
+    if (!out) return { ok: false, reason: 'short' };
+    const sr = this.sampleRate;
+    const max = Math.floor(MAX_BOUNCE_SECONDS * sr);
+    const l = out.l.length > max ? out.l.subarray(0, max) : out.l;
+    const r = out.r.length > max ? out.r.subarray(0, max) : out.r;
+    const old = this.loops[BOUNCE];
+    if (!old) {
+      const res = prepareLoop([l, r], sr);
+      if (!res.ok) return { ok: false, reason: res.reason };
+      this.setBuffer(BOUNCE, res.chans);
+    } else {
+      if (l.length < 0.1 * sr) return { ok: false, reason: 'short' };
+      if (peakOf([l, r]) < 0.001) return { ok: false, reason: 'quiet' };
+      const dl = old[0].slice();
+      const dr = (old[1] ?? old[0]).slice();
+      const keep = this.tracks[BOUNCE].keep;
+      layerInto(dl, l, this.dubOffset, keep);
+      layerInto(dr, r, this.dubOffset, keep);
+      this.setBuffer(BOUNCE, [dl, dr], true);
+    }
+    if (!this.playing) this.setPlaying(true);
+    return { ok: true };
   }
 
   /* ----------------------------------------------------------- projects -- */
@@ -779,11 +1040,10 @@ export class Engine {
   getProject(): ProjectData {
     return {
       app: 'FieldStretcher',
-      v: 1,
+      v: 2,
       sampleRate: this.sampleRate,
       masterLevel: this.masterLevel,
-      quality: this.quality,
-      tracks: this.tracks.map(({ seconds: _s, ...t }) => ({ ...t })),
+      tracks: this.tracks.map(({ seconds: _s, ...t }) => JSON.parse(JSON.stringify(t)) as Omit<TrackState, 'seconds'>),
       fx: JSON.parse(JSON.stringify(this.fx)) as FxState,
       seq: { ...this.sequencer.s, rate: this.seq.rate },
     };
@@ -792,9 +1052,10 @@ export class Engine {
   /**
    * Replace the whole state. Tolerant of old or hand-edited files: anything
    * missing or out of range falls back to the default. The sequencer is left
-   * off — a project should never start making sound by itself.
+   * off — a project should never start making sound by itself. A version-1
+   * project (four tracks) brings its first two tracks; the Bounce track starts empty.
    */
-  applyProject(d: Partial<ProjectData>, audio: (Float32Array | null)[], audioRate: number) {
+  applyProject(d: Partial<ProjectData>, loops: (Loop | null)[], audioRate: number) {
     const def = defaultFx();
     const f = (d.fx ?? {}) as Partial<FxState>;
     const r = (f.reso ?? {}) as Partial<ResoState>;
@@ -832,23 +1093,27 @@ export class Engine {
       level: num(f.level, 0, 1, def.level),
     };
     const kinds: EngineKind[] = ['spectral', 'granular', 'tape'];
+    const fresh = defaultTrack();
     for (let i = 0; i < TRACKS; i++) {
       const src = (d.tracks?.[i] ?? {}) as Partial<TrackState>;
-      const dflt = DEFAULTS[i];
       const tr = this.tracks[i];
-      tr.engine = kinds.includes(src.engine as EngineKind) ? (src.engine as EngineKind) : dflt.engine;
-      tr.stretch = num(src.stretch, 1, 1000, dflt.stretch);
+      tr.engine = kinds.includes(src.engine as EngineKind) ? (src.engine as EngineKind) : fresh.engine;
+      tr.stretch = num(src.stretch, 1, 1000, fresh.stretch);
+      tr.glide = num(src.glide, 0, 10, fresh.glide);
       tr.pitch = Math.round(num(src.pitch, -24, 24, 0));
       tr.reverse = bool(src.reverse, false);
       tr.freeze = bool(src.freeze, false);
-      tr.level = num(src.level, 0, 1, 0.8);
+      tr.level = num(src.level, 0, 1, fresh.level);
       tr.pan = num(src.pan, -1, 1, 0);
       tr.mute = bool(src.mute, false);
-      tr.send = num(src.send, 0, 1, 0.3);
-      const a = audio[i];
-      if (a && a.length >= 256) {
-        const data = audioRate === this.sampleRate ? a : resampleTo(a, Math.round((a.length * this.sampleRate) / audioRate));
-        this.setBuffer(i, data);
+      tr.send = num(src.send, 0, 1, fresh.send);
+      tr.overdub = bool(src.overdub, false);
+      tr.keep = num(src.keep, 0, 1, fresh.keep);
+      tr.sound = readSound(src.sound);
+      const a = loops[i];
+      if (a && a[0].length >= 256) {
+        const chans = audioRate === this.sampleRate ? a : a.map((c) => resampleTo(c, Math.round((c.length * this.sampleRate) / audioRate)));
+        this.setBuffer(i, chans);
         // setBuffer resets the loop window; put the saved one back
         tr.start = num(src.start, 0, 1, 0);
         tr.end = num(src.end, 0, 1, 1);
@@ -857,8 +1122,6 @@ export class Engine {
       this.update(i, {});
     }
     this.masterLevel = num(d.masterLevel, 0, 1, 0.85);
-    const q = d.quality;
-    this.quality = q === 'draft' || q === 'normal' || q === 'high' ? q : 'normal';
     const sq = (d.seq ?? {}) as Partial<SeqSettings & { rate: number }>;
     this.seq.rate = num(sq.rate, 0.15, 30, 3);
     this.setSeqOn(false);
@@ -873,11 +1136,12 @@ export class Engine {
     });
     this.sequencer.reseed(Math.round(num(sq.seed, 0, 1e9, 1)));
     // push everything to the audio side
-    if (this.ctx && this.stages) {
+    if (this.ctx && this.g) {
       this.setMaster(this.masterLevel);
       this.setFxLevel(this.fx.level);
       for (const sec of ['reso', 'delay', 'reverb'] as const) this.updateFx(sec, { mix: this.fx[sec].mix });
-      this.stages.reso.node.port.postMessage({ type: 'chord' });
+      this.g.stages.reso.node.port.postMessage({ type: 'chord' });
+      this.applyAllMix();
     }
     this.manualNote = false;
     this.touch();
@@ -886,16 +1150,18 @@ export class Engine {
 
   /** A blank slate: empty tracks, default settings. */
   newProject() {
-    this.applyProject({}, [null, null, null, null], this.sampleRate);
+    this.applyProject({}, Array(TRACKS).fill(null), this.sampleRate);
   }
 
-  /** Apply a scene (settings only — the recordings stay). */
+  /** Apply a scene (settings only — the recordings and their loop windows stay). */
   applyScene(scene: Scene) {
     const cur = this.getProject();
-    const audio = this.audio.map((a) => a);
     const merged: Partial<ProjectData> = {
       ...cur,
-      tracks: cur.tracks.map((t, i) => ({ ...t, ...(scene.tracks[i] ?? {}), start: t.start, end: t.end })),
+      tracks: cur.tracks.map((t, i) => {
+        const s = scene.tracks[i] ?? {};
+        return { ...t, ...s, sound: mergeSound(t.sound, s.sound), start: t.start, end: t.end };
+      }),
       fx: {
         reso: { ...cur.fx.reso, ...scene.fx.reso },
         delay: { ...cur.fx.delay, ...scene.fx.delay },
@@ -904,8 +1170,22 @@ export class Engine {
       },
       seq: { ...cur.seq, ...scene.seq },
     };
-    this.applyProject(merged, audio, this.sampleRate);
+    this.applyProject(merged, this.loops.map((a) => a), this.sampleRate);
     if (scene.seqOn) this.setSeqOn(true);
+  }
+
+  /** The current settings as a scene (no audio, no loop windows). */
+  captureScene(name: string, blurb = 'Saved from your settings.'): Scene {
+    const p = this.getProject();
+    return {
+      name,
+      blurb,
+      user: true,
+      tracks: p.tracks.map(({ start: _a, end: _b, ...t }) => t),
+      fx: p.fx,
+      seq: p.seq,
+      seqOn: this.seq.on,
+    };
   }
 
   /** Release the mic and context. */

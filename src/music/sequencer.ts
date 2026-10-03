@@ -160,3 +160,29 @@ export class Sequencer {
     }
   }
 }
+
+export interface PlannedNote {
+  type: 'note';
+  frame: number;
+  note: number;
+  offsets: number[] | null;
+  pluck: number;
+}
+
+/**
+ * The whole note list for an offline render: a fresh walk from this seed,
+ * one tick every `rate` seconds, as absolute frames the resonator can queue.
+ */
+export function planSequence(s: SeqSettings, rate: number, seconds: number, tonic: number, sr: number): PlannedNote[] {
+  const q = new Sequencer({ ...s });
+  q.reseed(s.seed);
+  const out: PlannedNote[] = [];
+  const note = (at: number, st: Step) => out.push({ type: 'note', frame: Math.round(at * sr), note: tonic + st.semis, offsets: st.offsets, pluck: 0 });
+  let at = 0.05;
+  note(at, q.describe(q.index));
+  for (at += rate; at < seconds; at += rate) {
+    const st = q.next();
+    if (st) note(at, st);
+  }
+  return out;
+}
