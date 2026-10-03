@@ -16,7 +16,7 @@ const posFromGlide = (g: number) => Math.log(g / 0.005) / Math.log(800);
 
 const fmtSec = (t: number) => (t < 1 ? `${Math.round(t * 1000)} ms` : `${t.toFixed(t < 10 ? 1 : 0)} s`);
 
-export function buildSeqPanel(engine: Engine): HTMLElement {
+export function buildSeqPanel(engine: Engine, life: AbortSignal): HTMLElement {
   const q = engine.sequencer;
 
   /* ---- on/off + now playing ---- */
@@ -100,6 +100,7 @@ export function buildSeqPanel(engine: Engine): HTMLElement {
   // the LED: light whichever note is sounding
   let shown = -2;
   const tick = () => {
+    if (life.aborted) return;
     const st = engine.seq.on || stripActive() ? engine.currentStep() : null;
     const idx = st ? st.index : -1;
     if (idx !== shown) {

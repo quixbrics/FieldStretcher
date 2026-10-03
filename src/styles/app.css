@@ -206,3 +206,18 @@ h1, h2, h3, p { margin: 0; }
 .seed-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .seed-row .btn { flex: 1; }
 .seed { color: var(--text-muted); }
+
+/* ---- mix recorder, scenes, file hand-off ---- */
+.mixrec { min-height: 52px; padding: 0 14px; border-radius: 26px; border: 1px solid var(--danger-border); color: var(--danger); font-weight: 600; font-family: var(--font-mono); font-size: 14px; white-space: nowrap; }
+.mixrec[aria-pressed='true'] { background: var(--danger); border-color: var(--danger); color: var(--accent-ink); }
+.transport { gap: 10px; }
+.master { min-width: 0; }
+.scenes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.scene { text-align: left; border: 1px solid var(--border-ctl); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 2px; min-height: 84px; }
+.scene b { color: var(--text-strong); font-weight: 600; }
+.scene span { color: var(--text-muted); font-size: 12px; line-height: 1.3; }
+.scene:active { background: var(--raised); }
+.file-ready { border: 1px solid var(--accent-border); background: var(--accent-bg); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+.file-ready .actions { grid-template-columns: 1fr 1fr; padding-top: 4px; }
+.sheet-body .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.sheet-body .seg { flex: none; }

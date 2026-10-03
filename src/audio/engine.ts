@@ -16,7 +16,7 @@
  * mic request is fired in that same tap, in parallel with loading the DSP.
  */
 import { ensureWorklets, workletNode } from './worklets';
-import { MAX_SECONDS, computePeaks, concat, prepareLoop, toMono } from './loopfx';
+import { MAX_SECONDS, computePeaks, concat, prepareLoop, repairSpeed, resampleTo, toMono } from './loopfx';
 import { Sequencer, type SeqSettings, type Step } from '../music/sequencer';
 
 export const TRACKS = 4;
@@ -89,6 +89,32 @@ export const NOTE_NAMES = ['C', 'C♯', 'D', 'E♭', 'E', 'F', 'F♯', 'G', 'A�
 /** MIDI note of a root + octave (octave 3, A = 57 = A3 = 220 Hz) */
 export const noteOf = (root: number, octave: number): number => 12 * (octave + 1) + root;
 
+/** What a saved project holds (the audio is stored beside it). */
+export interface ProjectData {
+  app: 'FieldStretcher';
+  v: 1;
+  sampleRate: number;
+  masterLevel: number;
+  quality: Quality;
+  tracks: Omit<TrackState, 'seconds'>[];
+  fx: FxState;
+  seq: SeqSettings & { rate: number };
+}
+
+/** What happened to the most recent take (shown in Settings, to diagnose a wrong-speed recording). */
+export interface TakeInfo {
+  heardSeconds: number;
+  realSeconds: number;
+  /** 1 = fine; otherwise the speed error that was repaired */
+  repaired: number;
+}
+
+/** longest mix recording (stereo float in memory) */
+export const MAX_MIX_SECONDS = 180;
+
+const num = (v: unknown, lo: number, hi: number, def: number): number => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def);
+const bool = (v: unknown, def: boolean): boolean => (typeof v === 'boolean' ? v : def);
+
 export interface SeqState {
   on: boolean;
   /** seconds per step */
@@ -125,16 +151,28 @@ export interface EngineEvents {
   blowup(): void;
   /** a track's audio was loaded, replaced or cleared */
   track(track: number): void;
+  /** the whole state was replaced (project opened, scene applied, new project): rebuild the UI */
+  project(): void;
+  /** mix recording progress, seconds */
+  bounceTime(seconds: number): void;
+  /** mix recording hit its length limit */
+  bounceAutoStop(): void;
+}
+
+/** A starting point: settings only, applied over the current tracks. */
+export interface Scene {
+  name: string;
+  blurb: string;
+  tracks: Partial<Omit<TrackState, 'seconds' | 'start' | 'end'>>[];
+  fx: { reso?: Partial<ResoState>; delay?: Partial<DelayState>; reverb?: Partial<ReverbState>; level?: number };
+  seq?: Partial<SeqSettings & { rate: number }>;
+  seqOn?: boolean;
 }
 
 export type RecResult = { ok: true } | { ok: false; reason: 'short' | 'quiet' | 'idle' };
 
-const DEFAULTS: Pick<TrackState, 'engine' | 'stretch'>[] = [
-  { engine: 'spectral', stretch: 8 },
-  { engine: 'granular', stretch: 4 },
-  { engine: 'tape', stretch: 2 },
-  { engine: 'spectral', stretch: 64 },
-];
+/** Every track starts as a plain loop at normal speed (tape at 1×); stretching is opt-in. */
+const DEFAULTS: Pick<TrackState, 'engine' | 'stretch'>[] = Array.from({ length: 4 }, () => ({ engine: 'tape' as EngineKind, stretch: 1 }));
 
 interface TrackNodes {
   looper: AudioWorkletNode;
@@ -196,6 +234,27 @@ export class Engine {
   private manualNote = false;
   private seqLog: { at: number; step: Step }[] = [];
   private fxListeners = new Set<() => void>();
+  private changeListeners = new Set<(audioTrack?: number) => void>();
+  private recWall0 = 0;
+  private tap: AudioWorkletNode | null = null;
+  private bounceChunks: { l: Float32Array; r: Float32Array }[] = [];
+  private bounceSamples = 0;
+  private bounceDone: (() => void) | null = null;
+  bouncing = false;
+  /** audio-path facts for the Settings sheet */
+  diag: { ctxRate: number; micRate: number | null; take: TakeInfo | null } = { ctxRate: 0, micRate: null, take: null };
+
+  /** Subscribe to any state change (autosave). `audioTrack` is set when that track's audio changed. */
+  onChange(fn: (audioTrack?: number) => void): void {
+    this.changeListeners.add(fn);
+  }
+  private touch(audioTrack?: number) {
+    for (const l of this.changeListeners) l(audioTrack);
+  }
+  /** Drop UI subscriptions before the UI is rebuilt. */
+  clearUiListeners() {
+    this.fxListeners.clear();
+  }
 
   get started(): boolean {
     return this.nodes.length > 0;
@@ -222,6 +281,7 @@ export class Engine {
     const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const ctx = new AC({ latencyHint: 'interactive' });
     this.ctx = ctx;
+    this.diag.ctxRate = ctx.sampleRate;
     ctx.onstatechange = () => this.events.ctxState?.(ctx.state);
     void ctx.resume();
     // fire the mic request now, inside the tap, in parallel with DSP loading
@@ -326,6 +386,7 @@ export class Engine {
 
   updateFx<K extends 'reso' | 'delay' | 'reverb'>(section: K, patch: Partial<FxState[K]>) {
     Object.assign(this.fx[section], patch);
+    this.touch();
     for (const l of this.fxListeners) l();
     if (section === 'reso' && ('root' in patch || 'octave' in patch)) {
       this.manualNote = false;
@@ -344,6 +405,7 @@ export class Engine {
 
   setFxLevel(v: number) {
     this.fx.level = v;
+    this.touch();
     if (this.ctx) this.busOut.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
   }
 
@@ -381,6 +443,7 @@ export class Engine {
     const { rate, ...settings } = patch;
     if (rate !== undefined) this.seq.rate = rate;
     Object.assign(this.sequencer.s, settings);
+    this.touch();
     if (patch.range !== undefined || patch.scale !== undefined) this.sequencer.set(Math.min(this.sequencer.index, this.sequencer.max));
     for (const l of this.fxListeners) l();
     if (this.seq.on) this.seqReschedule(patch.scale !== undefined || patch.chordSize !== undefined || patch.range !== undefined);
@@ -390,6 +453,7 @@ export class Engine {
   /** a new seed: a new line, from the tonic */
   reseed(seed = Math.floor(Math.random() * 1e6)) {
     this.sequencer.reseed(seed);
+    this.touch();
     for (const l of this.fxListeners) l();
     if (this.seq.on) this.seqReschedule(true);
   }
@@ -474,6 +538,7 @@ export class Engine {
 
   private attachMic(stream: MediaStream, ctx: AudioContext) {
     this.stream = stream;
+    this.diag.micRate = stream.getAudioTracks()[0]?.getSettings().sampleRate ?? null;
     const src = ctx.createMediaStreamSource(stream);
     const cap = workletNode(ctx, 'fs-capture', {}, 1, 1);
     cap.port.onmessage = (e) => {
@@ -505,6 +570,7 @@ export class Engine {
     this.chunks = [];
     this.recSamples = 0;
     this.recTrack = track;
+    this.recWall0 = performance.now();
     this.applyMix(track); // a track that is being re-recorded goes quiet
     this.capture.port.postMessage({ type: 'rec', on: true });
     if (!this.playing) this.setPlaying(true);
@@ -523,6 +589,7 @@ export class Engine {
   async stopRecording(): Promise<RecResult> {
     const t = this.recTrack;
     if (t < 0 || !this.capture) return { ok: false, reason: 'idle' };
+    const wall = (performance.now() - this.recWall0) / 1000;
     const done = new Promise<void>((res) => {
       this.recDone = res;
       setTimeout(res, 600); // never hang if the context was suspended
@@ -533,9 +600,14 @@ export class Engine {
     this.recTrack = -1;
     let raw = concat(this.chunks);
     this.chunks = [];
-    const max = Math.floor(MAX_SECONDS * this.sampleRate);
+    const sr = this.sampleRate;
+    // a take must be as long as the time that really passed; if not, the speed was wrong
+    const fixed = repairSpeed(raw, sr, wall);
+    raw = fixed.data;
+    this.diag.take = { heardSeconds: this.recSamples / sr, realSeconds: wall, repaired: fixed.ratio };
+    const max = Math.floor(MAX_SECONDS * sr);
     if (raw.length > max) raw = raw.subarray(0, max);
-    const res = prepareLoop(raw, this.sampleRate);
+    const res = prepareLoop(raw, sr);
     if (res.ok) this.setBuffer(t, res.data);
     this.applyMix(t);
     return res.ok ? { ok: true } : { ok: false, reason: res.reason };
@@ -553,6 +625,7 @@ export class Engine {
     this.nodes[track].looper.port.postMessage({ type: 'buffer', channels: [copy] }, [copy.buffer]);
     this.update(track, { start: 0, end: 1 });
     this.events.track?.(track);
+    this.touch(track);
   }
 
   clearTrack(track: number) {
@@ -561,6 +634,7 @@ export class Engine {
     this.tracks[track].seconds = 0;
     this.nodes[track]?.looper.port.postMessage({ type: 'buffer', channels: [] });
     this.events.track?.(track);
+    this.touch(track);
   }
 
   async importFile(track: number, file: File): Promise<RecResult> {
@@ -596,6 +670,7 @@ export class Engine {
   update(track: number, patch: Partial<TrackState>) {
     const t = this.tracks[track];
     Object.assign(t, patch);
+    this.touch();
     const n = this.nodes[track];
     if (!n) return;
     n.looper.port.postMessage({ type: 'params', params: this.looperParams(t) });
@@ -615,11 +690,13 @@ export class Engine {
 
   setMaster(v: number) {
     this.masterLevel = v;
+    this.touch();
     if (this.ctx) this.master.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
   }
 
   setQuality(q: Quality) {
     this.quality = q;
+    this.touch();
     for (let i = 0; i < TRACKS; i++) this.update(i, {});
   }
 
@@ -651,6 +728,184 @@ export class Engine {
     } catch {
       this.wake = null; // not allowed (low power mode, hidden tab) — harmless
     }
+  }
+
+
+  /* ----------------------------------------------------------- mix out -- */
+
+  /** Start recording what comes out of the speakers (after the limiter). */
+  startBounce(): boolean {
+    if (!this.ctx || !this.started || this.bouncing) return false;
+    if (!this.tap) {
+      this.tap = workletNode(this.ctx, 'fs-tap', {}, 1);
+      this.tap.port.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'chunk') {
+          this.bounceChunks.push({ l: m.l, r: m.r });
+          this.bounceSamples += m.l.length;
+          this.events.bounceTime?.(this.bounceSamples / this.sampleRate);
+          if (this.bounceSamples >= MAX_MIX_SECONDS * this.sampleRate) this.events.bounceAutoStop?.();
+        } else if (m.type === 'recStopped') this.bounceDone?.();
+      };
+      const silent = this.ctx.createGain();
+      silent.gain.value = 0;
+      this.safety.connect(this.tap).connect(silent).connect(this.ctx.destination);
+    }
+    this.bounceChunks = [];
+    this.bounceSamples = 0;
+    this.bouncing = true;
+    this.tap.port.postMessage({ type: 'rec', on: true });
+    return true;
+  }
+
+  async stopBounce(): Promise<{ l: Float32Array; r: Float32Array; sampleRate: number } | null> {
+    if (!this.bouncing || !this.tap) return null;
+    const done = new Promise<void>((res) => {
+      this.bounceDone = res;
+      setTimeout(res, 600);
+    });
+    this.tap.port.postMessage({ type: 'rec', on: false });
+    await done;
+    this.bounceDone = null;
+    this.bouncing = false;
+    const l = concat(this.bounceChunks.map((c) => c.l));
+    const r = concat(this.bounceChunks.map((c) => c.r));
+    this.bounceChunks = [];
+    return l.length ? { l, r, sampleRate: this.sampleRate } : null;
+  }
+
+  /* ----------------------------------------------------------- projects -- */
+
+  getProject(): ProjectData {
+    return {
+      app: 'FieldStretcher',
+      v: 1,
+      sampleRate: this.sampleRate,
+      masterLevel: this.masterLevel,
+      quality: this.quality,
+      tracks: this.tracks.map(({ seconds: _s, ...t }) => ({ ...t })),
+      fx: JSON.parse(JSON.stringify(this.fx)) as FxState,
+      seq: { ...this.sequencer.s, rate: this.seq.rate },
+    };
+  }
+
+  /**
+   * Replace the whole state. Tolerant of old or hand-edited files: anything
+   * missing or out of range falls back to the default. The sequencer is left
+   * off — a project should never start making sound by itself.
+   */
+  applyProject(d: Partial<ProjectData>, audio: (Float32Array | null)[], audioRate: number) {
+    const def = defaultFx();
+    const f = (d.fx ?? {}) as Partial<FxState>;
+    const r = (f.reso ?? {}) as Partial<ResoState>;
+    const dl = (f.delay ?? {}) as Partial<DelayState>;
+    const rv = (f.reverb ?? {}) as Partial<ReverbState>;
+    this.fx = {
+      reso: {
+        root: Math.round(num(r.root, 0, 11, def.reso.root)),
+        octave: Math.round(num(r.octave, 1, 5, def.reso.octave)),
+        chord: Math.round(num(r.chord, 0, RESO_CHORD_NAMES.length - 1, def.reso.chord)),
+        decay: num(r.decay, 0, 1, def.reso.decay),
+        bright: num(r.bright, 0, 1, def.reso.bright),
+        spread: num(r.spread, 0, 1, def.reso.spread),
+        glide: num(r.glide, 0.004, 4, def.reso.glide),
+        pluck: num(r.pluck, 0, 1, def.reso.pluck),
+        onset: num(r.onset, 0, 1, def.reso.onset),
+        input: num(r.input, 0, 1, def.reso.input),
+        mix: num(r.mix, 0, 1, def.reso.mix),
+      },
+      delay: {
+        time: num(dl.time, 50, 1500, def.delay.time),
+        feedback: num(dl.feedback, 0, 0.95, def.delay.feedback),
+        tone: num(dl.tone, 0, 1, def.delay.tone),
+        pingpong: bool(dl.pingpong, def.delay.pingpong),
+        mix: num(dl.mix, 0, 1, def.delay.mix),
+      },
+      reverb: {
+        size: num(rv.size, 0.3, 2, def.reverb.size),
+        decay: num(rv.decay, 1, 30, def.reverb.decay),
+        damping: num(rv.damping, 0, 0.95, def.reverb.damping),
+        shimmer: num(rv.shimmer, 0, 1, def.reverb.shimmer),
+        freeze: bool(rv.freeze, def.reverb.freeze),
+        mix: num(rv.mix, 0, 1, def.reverb.mix),
+      },
+      level: num(f.level, 0, 1, def.level),
+    };
+    const kinds: EngineKind[] = ['spectral', 'granular', 'tape'];
+    for (let i = 0; i < TRACKS; i++) {
+      const src = (d.tracks?.[i] ?? {}) as Partial<TrackState>;
+      const dflt = DEFAULTS[i];
+      const tr = this.tracks[i];
+      tr.engine = kinds.includes(src.engine as EngineKind) ? (src.engine as EngineKind) : dflt.engine;
+      tr.stretch = num(src.stretch, 1, 1000, dflt.stretch);
+      tr.pitch = Math.round(num(src.pitch, -24, 24, 0));
+      tr.reverse = bool(src.reverse, false);
+      tr.freeze = bool(src.freeze, false);
+      tr.level = num(src.level, 0, 1, 0.8);
+      tr.pan = num(src.pan, -1, 1, 0);
+      tr.mute = bool(src.mute, false);
+      tr.send = num(src.send, 0, 1, 0.3);
+      const a = audio[i];
+      if (a && a.length >= 256) {
+        const data = audioRate === this.sampleRate ? a : resampleTo(a, Math.round((a.length * this.sampleRate) / audioRate));
+        this.setBuffer(i, data);
+        // setBuffer resets the loop window; put the saved one back
+        tr.start = num(src.start, 0, 1, 0);
+        tr.end = num(src.end, 0, 1, 1);
+        if (tr.end - tr.start < 0.01) (tr.start = 0), (tr.end = 1);
+      } else this.clearTrack(i);
+      this.update(i, {});
+    }
+    this.masterLevel = num(d.masterLevel, 0, 1, 0.85);
+    const q = d.quality;
+    this.quality = q === 'draft' || q === 'normal' || q === 'high' ? q : 'normal';
+    const sq = (d.seq ?? {}) as Partial<SeqSettings & { rate: number }>;
+    this.seq.rate = num(sq.rate, 0.15, 30, 3);
+    this.setSeqOn(false);
+    const modes = ['lydian', 'ionian', 'mixolydian', 'dorian', 'aeolian', 'harmonicMinor', 'phrygian', 'octatonic'];
+    const motions = ['drift', 'arp', 'markov', 'wander', 'hold'];
+    Object.assign(this.sequencer.s, {
+      scale: modes.includes(sq.scale as string) ? sq.scale : 'dorian',
+      motion: motions.includes(sq.motion as string) ? sq.motion : 'drift',
+      range: Math.round(num(sq.range, 1, 3, 2)),
+      chance: num(sq.chance, 0, 1, 0.85),
+      chordSize: [0, 3, 4, 5].includes(sq.chordSize as number) ? sq.chordSize : 0,
+    });
+    this.sequencer.reseed(Math.round(num(sq.seed, 0, 1e9, 1)));
+    // push everything to the audio side
+    if (this.ctx && this.stages) {
+      this.setMaster(this.masterLevel);
+      this.setFxLevel(this.fx.level);
+      for (const sec of ['reso', 'delay', 'reverb'] as const) this.updateFx(sec, { mix: this.fx[sec].mix });
+      this.stages.reso.node.port.postMessage({ type: 'chord' });
+    }
+    this.manualNote = false;
+    this.touch();
+    this.events.project?.();
+  }
+
+  /** A blank slate: empty tracks, default settings. */
+  newProject() {
+    this.applyProject({}, [null, null, null, null], this.sampleRate);
+  }
+
+  /** Apply a scene (settings only — the recordings stay). */
+  applyScene(scene: Scene) {
+    const cur = this.getProject();
+    const audio = this.audio.map((a) => a);
+    const merged: Partial<ProjectData> = {
+      ...cur,
+      tracks: cur.tracks.map((t, i) => ({ ...t, ...(scene.tracks[i] ?? {}), start: t.start, end: t.end })),
+      fx: {
+        reso: { ...cur.fx.reso, ...scene.fx.reso },
+        delay: { ...cur.fx.delay, ...scene.fx.delay },
+        reverb: { ...cur.fx.reverb, ...scene.fx.reverb },
+        level: scene.fx.level ?? cur.fx.level,
+      },
+      seq: { ...cur.seq, ...scene.seq },
+    };
+    this.applyProject(merged, audio, this.sampleRate);
+    if (scene.seqOn) this.setSeqOn(true);
   }
 
   /** Release the mic and context. */

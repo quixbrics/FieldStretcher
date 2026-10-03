@@ -81,3 +81,30 @@ export function toMono(chans: Float32Array[]): Float32Array {
   for (const c of chans) for (let i = 0; i < out.length; i++) out[i] += c[i] / chans.length;
   return out;
 }
+
+/** Linear resample to a new length (used to repair a take whose speed was wrong, and to move audio between sample rates). */
+export function resampleTo(data: Float32Array, newLen: number): Float32Array {
+  const out = new Float32Array(newLen);
+  if (newLen <= 1 || data.length <= 1) return out;
+  const k = (data.length - 1) / (newLen - 1);
+  for (let i = 0; i < newLen; i++) {
+    const x = i * k;
+    const a = Math.floor(x);
+    const b = Math.min(data.length - 1, a + 1);
+    out[i] = data[a] + (data[b] - data[a]) * (x - a);
+  }
+  return out;
+}
+
+/**
+ * A take recorded at the wrong speed — frames dropped, or a microphone and
+ * context at different sample rates — is shorter or longer than the time that
+ * really passed. If the two disagree by more than 12% on a take of 2 s or more,
+ * stretch the take to the real duration. Returns the ratio it corrected (1 = left alone).
+ */
+export function repairSpeed(raw: Float32Array, sr: number, wallSeconds: number): { data: Float32Array; ratio: number } {
+  const got = raw.length / sr;
+  const ratio = got / wallSeconds;
+  if (wallSeconds < 2 || Math.abs(ratio - 1) <= 0.12) return { data: raw, ratio: 1 };
+  return { data: resampleTo(raw, Math.round(wallSeconds * sr)), ratio };
+}
