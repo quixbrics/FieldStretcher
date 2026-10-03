@@ -67,10 +67,34 @@ export function toggle(label: string, on: boolean, onChange: (v: boolean) => voi
   return b;
 }
 
+/**
+ * The Wet/Dry control: one slider for the whole sound. All the way to Dry you hear only the tracks as they are;
+ * all the way to Wet you hear only the effects (the direct sound is exactly zero). Used on the Tracks tab and the
+ * FX tab; the two stay in step.
+ */
+export function wetDryRow(engine: Engine, label = 'Wet'): HTMLElement {
+  const fmt = (v: number) => (v <= 0.005 ? 'dry' : v >= 0.995 ? 'WET' : `${Math.round(v * 100)}%`);
+  const row = slider(label, 0, 1, 0.01, engine.fx.wet, fmt, (v) => engine.setWet(v), 'Dry = only the tracks. Wet = only the effects, with no direct sound left.');
+  row.classList.add('wetdry');
+  engine.onFxChange(() => row.set(engine.fx.wet));
+  return row;
+}
+
 export function buildFxPanel(engine: Engine): HTMLElement {
   const fx = engine.fx;
-  const section = (title: string, sub: string, ...kids: Node[]) =>
-    h('section', { class: 'fx-card' }, h('header', {}, h('h2', {}, title), h('span', { class: 'sub' }, sub)), ...kids);
+  /** an effect's card: its name, an on/off switch (off = the sound goes around it), then its controls */
+  const section = (title: string, sub: string, key: 'reso' | 'delay' | 'reverb', ...kids: Node[]) => {
+    const sw = h('button', { class: 'switch', role: 'switch', 'aria-checked': fx[key].on, 'aria-label': `${title} on or off`, onclick: () => engine.updateFx(key, { on: !engine.fx[key].on } as never) }, h('i', {}));
+    const card = h('section', { class: 'fx-card' }, h('header', {}, h('h2', {}, title), h('span', { class: 'sub' }, sub), sw), ...kids);
+    const show = () => {
+      const on = engine.fx[key].on;
+      sw.setAttribute('aria-checked', String(on));
+      card.classList.toggle('off', !on);
+    };
+    engine.onFxChange(show);
+    show();
+    return card;
+  };
 
   const decay = slider('Decay', 0, 1, 0.005, fx.reso.decay, fmtDecay, (v) => engine.updateFx('reso', { decay: v }), 'How long a string rings. Short (under ~100 ms) makes plucks and ticks; long makes a drone.');
   const pluck = slider('Pluck', 0, 1, 0.01, fx.reso.pluck, pct, (v) => engine.updateFx('reso', { pluck: v }), 'A snap on every note change — set Decay short and each sequencer step becomes a plucked note');
@@ -88,7 +112,7 @@ export function buildFxPanel(engine: Engine): HTMLElement {
     for (const [k, el] of Object.entries(sliders)) if (k in p.v) el.set(p.v[k as keyof typeof p.v] as number);
   } }, p.label)));
 
-  const resonator = section('Resonator', 'tuned strings: drone or pluck',
+  const resonator = section('Resonator', 'tuned strings: drone or pluck', 'reso',
     ...keyControls(engine),
     h('div', { class: 'label-row' }, 'Chord'),
     pills(RESO_CHORD_NAMES.map((n, i) => ({ label: n, value: i })), fx.reso.chord, (v) => engine.updateFx('reso', { chord: v })),
@@ -100,30 +124,28 @@ export function buildFxPanel(engine: Engine): HTMLElement {
     input,
     bright,
     slider('Spread', 0, 1, 0.01, fx.reso.spread, pct, (v) => engine.updateFx('reso', { spread: v }), 'Stereo width (slight detune between ears)'),
-    slider('Mix', 0, 1, 0.01, fx.reso.mix, pct, (v) => engine.updateFx('reso', { mix: v })),
   );
 
-  const delay = section('Delay', 'tape-style echoes',
+  const delay = section('Delay', 'tape-style echoes', 'delay',
     slider('Time', 50, 1500, 1, fx.delay.time, (v) => `${Math.round(v)} ms`, (v) => engine.updateFx('delay', { time: v })),
     slider('Feedback', 0, 0.95, 0.01, fx.delay.feedback, pct, (v) => engine.updateFx('delay', { feedback: v })),
     slider('Tone', 0, 1, 0.01, fx.delay.tone, (v) => (v < 0.34 ? 'dark' : v < 0.67 ? 'warm' : 'bright'), (v) => engine.updateFx('delay', { tone: v }), 'Each repeat gets darker the lower this is'),
-    slider('Mix', 0, 1, 0.01, fx.delay.mix, pct, (v) => engine.updateFx('delay', { mix: v })),
     h('div', { class: 'toggles' }, toggle('Ping-pong', fx.delay.pingpong, (v) => engine.updateFx('delay', { pingpong: v }))),
   );
 
-  const reverb = section('Reverb', 'long, dense, endless',
+  const reverb = section('Reverb', 'long, dense, endless', 'reverb',
     slider('Size', 0.3, 2, 0.01, fx.reverb.size, (v) => v.toFixed(2), (v) => engine.updateFx('reverb', { size: v })),
     slider('Decay', 1, 30, 0.1, fx.reverb.decay, (v) => `${v.toFixed(1)} s`, (v) => engine.updateFx('reverb', { decay: v })),
     slider('Damping', 0, 0.95, 0.01, fx.reverb.damping, pct, (v) => engine.updateFx('reverb', { damping: v })),
     slider('Shimmer', 0, 1, 0.01, fx.reverb.shimmer, pct, (v) => engine.updateFx('reverb', { shimmer: v }), 'Feeds an octave-up copy of the tail back into the reverb'),
-    slider('Mix', 0, 1, 0.01, fx.reverb.mix, pct, (v) => engine.updateFx('reverb', { mix: v })),
     h('div', { class: 'toggles' }, toggle('Freeze tail', fx.reverb.freeze, (v) => engine.updateFx('reverb', { freeze: v }))),
   );
 
-  const ret = h('section', { class: 'fx-card' },
-    slider('FX return', 0, 1, 0.01, fx.level, pct, (v) => engine.setFxLevel(v), 'Level of the whole FX bus'),
-    h('p', { class: 'hint' }, 'Tracks feed the bus with their Send slider. Sends are taken before the level fader — turn a track’s Level down and its Send up for a wet-only sound.'),
+  const mixCard = h('section', { class: 'fx-card' },
+    h('header', {}, h('h2', {}, 'Wet / Dry'), h('span', { class: 'sub' }, 'one control for the whole sound')),
+    wetDryRow(engine),
+    h('p', { class: 'hint' }, 'Dry is the tracks alone. Wet is the effects alone, with none of the direct sound. The effects run in a chain: Resonator, then Delay, then Reverb. Switch one off to take it out of the chain.'),
   );
 
-  return h('div', { class: 'fx-panel' }, resonator, delay, reverb, ret);
+  return h('div', { class: 'fx-panel' }, mixCard, resonator, delay, reverb);
 }

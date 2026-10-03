@@ -135,7 +135,7 @@ export function buildSheet(engine: Engine, hp: SheetHelpers): Sheet {
   } }, 'Include each track as a stem');
   const renderBtn = h('button', { class: 'btn primary', onclick: async () => {
     if (hp.busy()) return;
-    if (engine.bouncing || engine.dubbing) return hp.say('Finish recording the mix first.');
+    if (engine.bouncing) return hp.say('Finish recording the mix first.');
     if (!engine.started) return hp.say('Tap to start first.');
     if (!engine.loops.some(Boolean)) return hp.say('Record or load a sound first.');
     const wasPlaying = engine.playing;

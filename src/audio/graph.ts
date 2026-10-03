@@ -2,13 +2,16 @@
  * The signal graph, built in ONE place for both live playback and offline
  * render, so the two can never drift apart.
  *
- *   looper ─► mute ─┬─► level ─► pan ───────────────┐
- *                   └─► send ─► FX BUS ─► return ───┴─► master ─► fxm-safety ─► out
+ *   looper ─► mute ─► level ─► pan ─┬─► dry ─────────────────────────────┐
+ *                                   └─► FX CHAIN ─► wet ─────────────────┴─► master ─► fxm-safety ─► out
  *
- *   FX BUS:  reso ─► delay ─► reverb, each blended dry/wet (equal power)
+ *   FX CHAIN:  reso ─► delay ─► reverb. Each effect passes ONLY its processed
+ *              sound (no dry inside the chain); switching one off routes the
+ *              signal around it.
  *
- * The send is taken BEFORE the level fader, so turning a track's level down
- * while its send is up gives a wet-only sound. Mute silences both.
+ * There is one Wet/Dry control. It cross-fades the `dry` and `wet` gains
+ * (equal power); at 100% wet the dry gain is exactly zero, so the wet sound
+ * is clean. If every effect is off there is no wet sound at all.
  */
 import { workletNode } from './worklets';
 
@@ -17,8 +20,10 @@ type Params = Record<string, number | string>;
 export interface Stage {
   input: GainNode;
   output: GainNode;
-  dry: GainNode;
-  wet: GainNode;
+  /** gain on the processed path (1 = effect on, 0 = bypassed) */
+  proc: GainNode;
+  /** gain on the route around the effect (the opposite) */
+  around: GainNode;
   node: AudioWorkletNode;
 }
 
@@ -27,22 +32,26 @@ export interface TrackNodes {
   mute: GainNode;
   gain: GainNode;
   pan: StereoPannerNode;
-  send: GainNode;
 }
 
 export interface GraphNodes {
   master: GainNode;
   safety: AudioWorkletNode;
+  /** the tracks' direct sound, on its way to the master */
+  dry: GainNode;
+  /** the FX chain's output, on its way to the master */
+  wet: GainNode;
   busIn: GainNode;
-  busOut: GainNode;
   stages: { reso: Stage; delay: Stage; reverb: Stage };
   tracks: TrackNodes[];
 }
 
 /** Everything the graph needs at the moment it is built. Gains are final linear values. */
 export interface GraphInit {
-  tracks: { params: Params; audio: Float32Array[] | null; seed: number; mute: number; gain: number; pan: number; send: number }[];
-  fx: { reso: Params; delay: Params; reverb: Params; mix: { reso: number; delay: number; reverb: number }; level: number };
+  tracks: { params: Params; audio: Float32Array[] | null; seed: number; mute: number; gain: number; pan: number }[];
+  fx: { reso: Params; delay: Params; reverb: Params; on: { reso: boolean; delay: boolean; reverb: boolean } };
+  /** Wet/Dry, 0 (all dry) – 1 (all wet) */
+  wet: number;
   master: number;
   /** notes for the resonator as absolute frames (offline render hands the whole sequence over up front) */
   resoQueue?: unknown[];
@@ -56,8 +65,19 @@ export interface GraphHooks {
   blowup?(): void;
 }
 
-/** equal-power dry/wet gains for a 0–1 mix */
-export const dryWet = (mix: number) => ({ dry: Math.cos((mix * Math.PI) / 2), wet: Math.sin((mix * Math.PI) / 2) });
+/**
+ * Equal-power cross-fade for a 0–1 Wet/Dry. At the ends one side is EXACTLY zero
+ * (cos(π/2) is not), so "all wet" really has no dry in it and vice versa.
+ */
+export function wetDryGains(wet: number): { dry: number; wet: number } {
+  const w = Math.min(1, Math.max(0, wet));
+  if (w <= 0) return { dry: 1, wet: 0 };
+  if (w >= 1) return { dry: 0, wet: 1 };
+  return { dry: Math.cos((w * Math.PI) / 2), wet: Math.sin((w * Math.PI) / 2) };
+}
+
+/** The gain on the wet path: the cross-fade, but silent if no effect is on (there is no wet sound to hear). */
+export const wetPathGain = (wet: number, on: { reso: boolean; delay: boolean; reverb: boolean }): number => (on.reso || on.delay || on.reverb ? wetDryGains(wet).wet : 0);
 
 export function buildGraph(ctx: BaseAudioContext, init: GraphInit, hooks: GraphHooks = {}): GraphNodes {
   const report = !!init.report;
@@ -70,32 +90,36 @@ export function buildGraph(ctx: BaseAudioContext, init: GraphInit, hooks: GraphH
   };
   master.connect(safety).connect(ctx.destination);
 
+  const dry = ctx.createGain();
+  const wet = ctx.createGain();
+  dry.gain.value = wetDryGains(init.wet).dry;
+  wet.gain.value = wetPathGain(init.wet, init.fx.on);
+  dry.connect(master);
+  wet.connect(master);
+
   const busIn = ctx.createGain();
-  const busOut = ctx.createGain();
-  busOut.gain.value = init.fx.level;
-  const stage = (name: string, params: Params, mix: number, extra: Record<string, unknown> = {}): Stage => {
+  const stage = (name: string, params: Params, on: boolean, extra: Record<string, unknown> = {}): Stage => {
     const node = workletNode(ctx, name, { params, report, ...extra }, 1);
     node.port.onmessage = (e) => {
       if (e.data.type === 'blowup') hooks.blowup?.();
     };
     const input = ctx.createGain();
     const output = ctx.createGain();
-    const dry = ctx.createGain();
-    const wet = ctx.createGain();
-    const g = dryWet(mix);
-    dry.gain.value = g.dry;
-    wet.gain.value = g.wet;
-    input.connect(node).connect(wet).connect(output);
-    input.connect(dry).connect(output);
-    return { input, output, dry, wet, node };
+    const proc = ctx.createGain();
+    const around = ctx.createGain();
+    proc.gain.value = on ? 1 : 0;
+    around.gain.value = on ? 0 : 1;
+    input.connect(node).connect(proc).connect(output);
+    input.connect(around).connect(output);
+    return { input, output, proc, around, node };
   };
-  const reso = stage('fxm-reso', init.fx.reso, init.fx.mix.reso, init.resoQueue ? { queue: init.resoQueue } : {});
-  const delay = stage('fxm-delay', init.fx.delay, init.fx.mix.delay);
-  const reverb = stage('fxm-fdn', init.fx.reverb, init.fx.mix.reverb);
+  const reso = stage('fxm-reso', init.fx.reso, init.fx.on.reso, init.resoQueue ? { queue: init.resoQueue } : {});
+  const delay = stage('fxm-delay', init.fx.delay, init.fx.on.delay);
+  const reverb = stage('fxm-fdn', init.fx.reverb, init.fx.on.reverb);
   busIn.connect(reso.input);
   reso.output.connect(delay.input);
   delay.output.connect(reverb.input);
-  reverb.output.connect(busOut).connect(master);
+  reverb.output.connect(wet);
 
   const tracks = init.tracks.map((t, i): TrackNodes => {
     const looper = workletNode(ctx, 'fxm-looper', { params: t.params, seed: t.seed, report, channels: t.audio ?? undefined }, 0);
@@ -106,16 +130,15 @@ export function buildGraph(ctx: BaseAudioContext, init: GraphInit, hooks: GraphH
     const mute = ctx.createGain();
     const gain = ctx.createGain();
     const pan = ctx.createStereoPanner();
-    const send = ctx.createGain();
     mute.gain.value = t.mute;
     gain.gain.value = t.gain;
     pan.pan.value = t.pan;
-    send.gain.value = t.send;
-    looper.connect(mute);
-    mute.connect(gain).connect(pan).connect(master);
-    mute.connect(send).connect(busIn);
-    return { looper, mute, gain, pan, send };
+    // the track's level and pan apply to BOTH the dry sound and what feeds the effects
+    looper.connect(mute).connect(gain).connect(pan);
+    pan.connect(dry);
+    pan.connect(busIn);
+    return { looper, mute, gain, pan };
   });
 
-  return { master, safety, busIn, busOut, stages: { reso, delay, reverb }, tracks };
+  return { master, safety, dry, wet, busIn, stages: { reso, delay, reverb }, tracks };
 }

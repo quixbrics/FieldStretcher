@@ -89,7 +89,7 @@ describe('wav', () => {
 describe('project files', () => {
   const project = (over: Partial<ProjectData> = {}): ProjectData => ({
     app: 'FieldStretcher',
-    v: 2,
+    v: 3,
     sampleRate: SR,
     masterLevel: 0.7,
     tracks: [],
@@ -97,43 +97,46 @@ describe('project files', () => {
     seq: { scale: 'dorian', motion: 'drift', range: 2, chance: 0.8, chordSize: 0, seed: 9, rate: 2 },
     ...over,
   });
-  it('packs and unpacks the settings and every loop, the Bounce track in stereo', async () => {
+  it('packs and unpacks the settings and both loops', async () => {
     const a = sine(220, 1, 0.5)[0];
-    const bl = sine(330, 0.5, 0.3)[0];
-    const br = sine(440, 0.5, 0.2)[0];
-    const blob = await packProject(project(), [[a], null, [bl, br]]);
+    const c = sine(330, 0.5, 0.3)[0];
+    const blob = await packProject(project(), [[a], [c]]);
     const out = unpackProject(await blob.arrayBuffer());
     expect(out.project.seq?.seed).toBe(9);
     expect(out.sampleRate).toBe(SR);
-    expect(out.loops[1]).toBeNull();
-    expect(out.loops[0]!.length).toBe(1);
+    expect(out.loops).toHaveLength(2);
     expect(out.loops[0]![0].length).toBe(a.length);
-    expect(out.loops[2]!.length).toBe(2);
-    expect(stats([out.loops[2]![1]]).peak).toBeCloseTo(0.2, 3);
+    expect(out.loops[1]![0].length).toBe(c.length);
     expect(stats([out.loops[0]![0]]).peak).toBeCloseTo(0.5, 3);
   });
-  it('the loops are plain WAVs inside the zip, so the file can be unzipped by hand', async () => {
-    const blob = await packProject(project(), [[sine(220, 0.3, 0.5)[0]], null, [sine(220, 0.3, 0.5)[0], sine(220, 0.3, 0.5)[0]]]);
-    const files = readZip(await blob.arrayBuffer());
-    expect([...files.keys()].sort()).toEqual(['loops/bounce.wav', 'loops/track1.wav', 'project.json']);
+  it('an empty track is simply left out', async () => {
+    const blob = await packProject(project(), [[sine(220, 0.3, 0.5)[0]], null]);
+    const out = unpackProject(await blob.arrayBuffer());
+    expect(out.loops[1]).toBeNull();
   });
-  it('opens a four-track (version 1) file: tracks 1 and 2 come across, the old track 3 does not become the Bounce track', async () => {
+  it('the loops are plain WAVs inside the zip, so the file can be unzipped by hand', async () => {
+    const blob = await packProject(project(), [[sine(220, 0.3, 0.5)[0]], [sine(220, 0.3, 0.5)[0]]]);
+    const files = readZip(await blob.arrayBuffer());
+    expect([...files.keys()].sort()).toEqual(['loops/track1.wav', 'loops/track2.wav', 'project.json']);
+  });
+  it('opens older files (four tracks, or two plus Bounce): tracks 1 and 2 come across, the rest is ignored', async () => {
     const { makeZip } = await import('../src/io/zip');
     const { encodeWav } = await import('../src/audio/wav');
     const wav = (f: number) => encodeWav([sine(f, 0.3, 0.5)[0]], SR, 24);
-    const zb = await (
-      await makeZip([
-        { name: 'project.json', data: JSON.stringify({ app: 'FieldStretcher', v: 1, sampleRate: SR }) },
-        { name: 'loops/track1.wav', data: wav(200) },
-        { name: 'loops/track2.wav', data: wav(300) },
-        { name: 'loops/track3.wav', data: wav(400) },
-        { name: 'loops/track4.wav', data: wav(500) },
-      ])
-    ).arrayBuffer();
-    const out = unpackProject(zb);
-    expect(out.loops[0]).not.toBeNull();
-    expect(out.loops[1]).not.toBeNull();
-    expect(out.loops[2]).toBeNull();
+    for (const v of [1, 2]) {
+      const zb = await (
+        await makeZip([
+          { name: 'project.json', data: JSON.stringify({ app: 'FieldStretcher', v, sampleRate: SR }) },
+          { name: 'loops/track1.wav', data: wav(200) },
+          { name: 'loops/track2.wav', data: wav(300) },
+          { name: 'loops/track3.wav', data: wav(400) },
+          { name: 'loops/bounce.wav', data: wav(500) },
+        ])
+      ).arrayBuffer();
+      const out = unpackProject(zb);
+      expect(out.loops).toHaveLength(2);
+      expect(out.loops.every(Boolean)).toBe(true);
+    }
   });
   it('rejects a zip that is not a FieldStretcher project, and files that are not zips at all', async () => {
     const { makeZip } = await import('../src/io/zip');

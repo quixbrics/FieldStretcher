@@ -54,16 +54,22 @@ describe('stock scenes', () => {
       expect(sc.tracks.length).toBeLessThanOrEqual(TRACKS);
       for (const t of sc.tracks) {
         if (t.stretch !== undefined) expect(t.stretch).toBeGreaterThanOrEqual(1);
-        if (t.send !== undefined) expect(t.send).toBeLessThanOrEqual(1);
         const d = defaultSound();
         for (const kind of ['tape', 'spectral', 'granular'] as const)
           for (const k of Object.keys(t.sound?.[kind] ?? {})) expect(Object.keys(d[kind])).toContain(k);
       }
     }
   });
-  it('Just Loops sends nothing to the FX and does not stretch', () => {
+  it('Just Loops is fully dry and does not stretch', () => {
     const j = SCENES.find((x) => x.name === 'Just Loops')!;
-    expect(j.tracks.every((t) => t.send === 0 && t.stretch === 1 && t.engine === 'tape')).toBe(true);
+    expect(j.fx.wet).toBe(0);
+    expect(j.tracks.every((t) => t.stretch === 1 && t.engine === 'tape' && t.link === true)).toBe(true);
+  });
+  it('every non-tape track in a scene is unlinked, so its pitch and stretch are independent', () => {
+    for (const sc of SCENES) for (const t of sc.tracks) if (t.engine && t.engine !== 'tape') expect(t.link).toBe(false);
+  });
+  it('wet is a 0–1 amount', () => {
+    for (const sc of SCENES) if (sc.fx.wet !== undefined) expect(sc.fx.wet).toBeGreaterThanOrEqual(0), expect(sc.fx.wet).toBeLessThanOrEqual(1);
   });
   it('focus maps 0 → diffuse, 0.5 → unchanged, 1 → tonal', () => {
     expect(focusToContrast(0)).toBeCloseTo(0.5);

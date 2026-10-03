@@ -56,8 +56,6 @@ export async function loadSaved(): Promise<Saved | null> {
       const v = await get<Loop | Float32Array>(`audio${i}`);
       loops.push(!v ? null : Array.isArray(v) ? v : [v]);
     }
-    // a version-1 (four-track) save: its third track is not the Bounce track
-    if (project.v === 1) loops[TRACKS - 1] = null;
     return { project, loops, sampleRate: project.sampleRate };
   } catch {
     return null;

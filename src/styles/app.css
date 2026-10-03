@@ -261,3 +261,25 @@ h1, h2, h3, p { margin: 0; }
 .sheet .chip[aria-pressed='true'] { border-color: var(--accent); color: var(--accent-text); background: var(--accent-bg); font-weight: 600; }
 .sheet .tog[aria-pressed='true'] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .sheet .toggles .tog { min-width: 0; flex: 1; }
+
+/* ---- Wet / Dry ---- */
+.wetbar { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 4px 12px; }
+.wetbar .row, .row.wetdry { grid-template-columns: 56px 1fr 64px; }
+.wetdry .val { color: var(--accent-text); }
+
+/* ---- pitch row with the link button ---- */
+.row.pitch { grid-template-columns: 56px 1fr 74px 50px; }
+.row.pitch .val { white-space: nowrap; font-size: 14px; }
+.linkbtn { min-height: 36px; border: 1px solid var(--border-ctl); border-radius: 6px; font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
+.linkbtn[aria-pressed='true'] { border-color: var(--c); color: var(--cl); background: var(--inset); font-weight: 600; }
+.link-note { font-size: 12px; margin: -2px 0 2px; }
+.track.linked .row.pitch .range::-webkit-slider-runnable-track, .track.linked .stretch-range::-webkit-slider-runnable-track { background: var(--c); opacity: 0.55; }
+
+/* ---- effect on/off switch ---- */
+.fx-card > header .switch { margin-left: auto; width: 46px; height: 28px; border-radius: 14px; background: var(--border-strong); position: relative; flex: none; }
+.fx-card > header .switch i { position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: var(--text-2); transition: transform 0.12s; }
+.fx-card > header .switch[aria-checked='true'] { background: var(--accent); }
+.fx-card > header .switch[aria-checked='true'] i { transform: translateX(18px); background: var(--accent-ink); }
+.fx-card > header { align-items: center; }
+.fx-card > header .sub { margin-left: 8px; }
+.fx-card.off > :not(header) { opacity: 0.45; }

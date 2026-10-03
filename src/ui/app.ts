@@ -1,14 +1,13 @@
 /*
- * FieldStretcher — mobile UI. Portrait, one hand: three track cards (two you record
- * onto and the Bounce track), an FX tab, a Seq tab, a fixed transport at the
- * bottom and settings in a sheet.
+ * FieldStretcher — mobile UI. Portrait, one hand: two track cards, an FX tab, a
+ * Seq tab, a fixed transport at the bottom and settings in a sheet.
  */
-import { BOUNCE, Engine, MAX_MIX_SECONDS, TRACKS } from '../audio/engine';
-import { MAX_BOUNCE_SECONDS, MAX_SECONDS } from '../audio/loopfx';
+import { Engine, MAX_MIX_SECONDS, TRACKS } from '../audio/engine';
+import { MAX_SECONDS } from '../audio/loopfx';
 import { encodeWav } from '../audio/wav';
 import { stamp } from '../io/project';
 import { loadSaved } from '../io/autosave';
-import { buildFxPanel } from './fxPanel';
+import { buildFxPanel, wetDryRow } from './fxPanel';
 import { buildSeqPanel } from './seqPanel';
 import { buildSheet } from './settings';
 import { TrackCard } from './trackCard';
@@ -41,7 +40,7 @@ export function mountApp(root: HTMLElement, engine: Engine) {
     toastTimer = window.setTimeout(() => toast.classList.remove('show'), 3200);
   };
   const busy = () => {
-    if (engine.recTrack >= 0 || engine.dubbing) {
+    if (engine.recTrack >= 0) {
       say('Stop recording first.');
       return true;
     }
@@ -53,14 +52,13 @@ export function mountApp(root: HTMLElement, engine: Engine) {
   const cards: TrackCard[] = [];
   const syncAll = () => {
     cards.forEach((c) => c.syncState());
-    playBtn.disabled = engine.recTrack >= 0 || engine.dubbing;
-    mixBtn.disabled = engine.dubbing;
+    playBtn.disabled = engine.recTrack >= 0;
   };
 
   async function onRec(i: number) {
     if (!engine.started) await engine.start();
     if (engine.recTrack === i) return stopRec();
-    if (engine.recTrack >= 0 || engine.dubbing) return;
+    if (engine.recTrack >= 0) return;
     if (!engine.hasMic) {
       say(engine.micError ?? 'No microphone available.');
       return;
@@ -81,28 +79,7 @@ export function mountApp(root: HTMLElement, engine: Engine) {
     else if (r.reason === 'short') say('Too short — hold on for at least ¼ second.');
   }
 
-  async function onDub(i: number) {
-    if (!engine.started) return;
-    if (engine.dubSource === i) return stopDub();
-    if (engine.dubbing || engine.recTrack >= 0 || engine.bouncing) return;
-    if (!engine.loops[i]) return say('Record something on this track first.');
-    if (engine.startDub(i)) {
-      cards[BOUNCE].wave.setRecLevel(0, '00:00');
-      syncAll();
-      say('Dubbing: this track plays on its own while it records.');
-    }
-  }
-
-  async function stopDub() {
-    if (!engine.dubbing) return;
-    const r = await engine.stopDub();
-    syncAll();
-    if (r.ok) say('Dubbed onto Bounce.');
-    else if (r.reason === 'quiet') say('Nothing audible was dubbed — is the track’s level up?');
-    else if (r.reason === 'short') say('Too short to dub.');
-  }
-
-  for (let i = 0; i < TRACKS; i++) cards.push(new TrackCard(engine, i, { say, rec: (k) => void onRec(k), dub: (k) => void onDub(k) }));
+  for (let i = 0; i < TRACKS; i++) cards.push(new TrackCard(engine, i, { say, rec: (k) => void onRec(k) }));
 
   /* ---------------------------------------------------------- transport -- */
 
@@ -156,7 +133,8 @@ export function mountApp(root: HTMLElement, engine: Engine) {
   );
   const transport = h('footer', { class: 'transport' }, playBtn, mixBtn, h('label', { class: 'master' }, h('span', {}, 'Vol'), master));
 
-  const trackList = h('main', { class: 'tracks', id: 'tab-tracks' }, micNote, ...cards.map((c) => c.root));
+  const wetBar = h('div', { class: 'wetbar' }, wetDryRow(engine));
+  const trackList = h('main', { class: 'tracks', id: 'tab-tracks' }, micNote, wetBar, ...cards.map((c) => c.root));
   const fxList = h('main', { class: 'tracks', id: 'tab-fx', hidden: true }, buildFxPanel(engine));
   const seqList = h('main', { class: 'tracks', id: 'tab-seq', hidden: true }, buildSeqPanel(engine, life));
   const panels = [trackList, fxList, seqList];
@@ -177,7 +155,7 @@ export function mountApp(root: HTMLElement, engine: Engine) {
     h('div', { class: 'splash-card' },
       h('img', { class: 'splash-icon', src: `${import.meta.env.BASE_URL}icon-192.png`, alt: '', width: 72, height: 72 }),
       h('h1', {}, 'Field', h('b', {}, 'Stretcher')),
-      h('p', {}, 'Record the world onto two loops, stretch each one into a drone, dub them onto a third, and wash it all through resonance, delay and reverb.'),
+      h('p', {}, 'Record the world onto two loops, stretch each one into a drone, and wash it through resonance, delay and reverb.'),
       h('p', { class: 'hint' }, 'Headphones recommended. FieldStretcher needs your microphone to record — nothing leaves your phone.'),
       h('button', { class: 'btn primary big', onclick: async (e: Event) => {
         const b = e.currentTarget as HTMLButtonElement;
@@ -247,20 +225,15 @@ export function mountApp(root: HTMLElement, engine: Engine) {
       void stopRec();
       say(`Reached ${MAX_SECONDS} seconds.`);
     },
-    dubTime(sec) {
-      cards[BOUNCE].wave.setRecLevel(0, `${fmtTime(sec)} / ${fmtTime(MAX_BOUNCE_SECONDS)}`);
-      cards.forEach((c) => c.setDubTime(sec));
-    },
-    dubAutoStop() {
-      void stopDub();
-      say(`Reached ${MAX_BOUNCE_SECONDS} seconds.`);
-    },
     blowup() {
       say('Audio glitch caught and reset.');
     },
     track(i) {
       cards[i]?.refresh();
       syncAll();
+    },
+    trackParams(i) {
+      cards[i]?.syncControls();
     },
     // a project, scene or new-project replaced the state: rebuild every control from it
     project() {

@@ -1,18 +1,18 @@
 /*
  * .fieldstretcher files: a plain (store-only) ZIP holding project.json and each
- * track's loop as a 24-bit WAV (the Bounce track is stereo). Rename it to .zip and
- * the sounds are right there; open it in the app and everything comes back.
+ * track's loop as a 24-bit WAV. Rename it to .zip and the sounds are right there;
+ * open it in the app and everything comes back.
  *
- *   project.json, loops/track1.wav, loops/track2.wav, loops/bounce.wav
+ *   project.json, loops/track1.wav, loops/track2.wav
  *
- * Files from the four-track version (loops/track1–4.wav) still open: tracks 1 and 2
- * come across, the Bounce track starts empty.
+ * Older files still open: from the four-track and the Bounce versions, tracks 1 and 2
+ * come across and the rest is ignored.
  */
 import { makeZip, readZip } from './zip';
 import { encodeWav, parseWav } from '../audio/wav';
 import { TRACKS, type Loop, type ProjectData } from '../audio/engine';
 
-const fileFor = (i: number): string => (i === TRACKS - 1 ? 'loops/bounce.wav' : `loops/track${i + 1}.wav`);
+const fileFor = (i: number): string => `loops/track${i + 1}.wav`;
 
 export async function packProject(p: ProjectData, loops: (Loop | null)[]): Promise<Blob> {
   const files: { name: string; data: Blob | string }[] = [{ name: 'project.json', data: JSON.stringify(p, null, 2) }];
@@ -36,9 +36,7 @@ export function unpackProject(buf: ArrayBuffer): { project: Partial<ProjectData>
   const loops: (Loop | null)[] = Array(TRACKS).fill(null);
   let sampleRate = typeof project.sampleRate === 'number' ? project.sampleRate : 48000;
   for (let i = 0; i < TRACKS; i++) {
-    // a version-1 file's third track is not the Bounce track
-    const name = project.v === 1 && i === TRACKS - 1 ? null : fileFor(i);
-    const w = name ? files.get(name) : undefined;
+    const w = files.get(fileFor(i));
     if (!w) continue;
     const wav = parseWav(w);
     loops[i] = wav.channels.slice(0, 2);

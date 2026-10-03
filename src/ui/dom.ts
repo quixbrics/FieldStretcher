@@ -14,11 +14,12 @@ export function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Attrs = 
   return el;
 }
 
-/** Stretch slider position (0–1) ⇄ ratio (1–1000), logarithmic. */
-export const stretchFromPos = (v: number): number => Math.pow(1000, v);
-export const posFromStretch = (s: number): number => Math.log(Math.max(1, s)) / Math.log(1000);
+/** Stretch slider position (0–1) ⇄ ratio (0.25–1000), logarithmic; 1× is about a third of the way along. */
+export const stretchFromPos = (v: number): number => 0.25 * Math.pow(4000, v);
+export const posFromStretch = (s: number): number => Math.log(Math.max(0.25, s) / 0.25) / Math.log(4000);
 
 export function fmtStretch(s: number): string {
+  if (s < 1) return `${s.toFixed(2)}×`;
   if (s < 10) return `${s.toFixed(1)}×`;
   return `${Math.round(s)}×`;
 }
@@ -29,5 +30,7 @@ export function fmtTime(sec: number): string {
 }
 
 export function fmtSemis(n: number): string {
-  return `${n > 0 ? '+' : n < 0 ? '−' : ''}${Math.abs(n)} st`;
+  const a = Math.abs(n);
+  const txt = Math.abs(a - Math.round(a)) < 0.05 ? String(Math.round(a)) : a.toFixed(1);
+  return `${a < 0.05 ? '' : n > 0 ? '+' : '−'}${a < 0.05 ? '0' : txt} st`;
 }

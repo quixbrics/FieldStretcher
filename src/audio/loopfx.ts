@@ -12,8 +12,6 @@ const MAX_GAIN = 100; // +40 dB
 const SILENCE = 0.001; // below this peak there is nothing there
 export const MIN_SECONDS = 0.25;
 export const MAX_SECONDS = 30;
-/** the bounce track holds up to a minute */
-export const MAX_BOUNCE_SECONDS = 60;
 
 export type LoopResult = { ok: true; chans: Float32Array[] } | { ok: false; reason: 'short' | 'quiet' };
 

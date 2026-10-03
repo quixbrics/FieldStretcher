@@ -1,17 +1,15 @@
 /*
- * The audio engine: one AudioContext, the microphone, three loop tracks (two
- * you record onto, plus the Bounce track that tracks are dubbed onto) and the
+ * The audio engine: one AudioContext, the microphone, two loop tracks and the
  * master chain. The graph itself is built in graph.ts (shared with offline render).
  *
  *   mic ─► fs-capture (raw PCM, meter) ─► [taken when a track is armed]
- *   master ─► fxm-safety ─► out ─► fs-tap (records the mix, or a dub onto Bounce)
+ *   master ─► fxm-safety ─► out ─► fs-tap (records the mix)
  *
  * The context is created inside the first tap (iOS refuses otherwise), and the
  * mic request is fired in that same tap, in parallel with loading the DSP.
  */
 import { ensureWorklets, workletNode } from './worklets';
 import {
-  MAX_BOUNCE_SECONDS,
   MAX_SECONDS,
   computePeaks,
   concat,
@@ -23,18 +21,16 @@ import {
   resampleTo,
   toMono,
 } from './loopfx';
-import { buildGraph, dryWet, type GraphInit, type GraphNodes, type TrackNodes } from './graph';
+import { buildGraph, wetDryGains, wetPathGain, type GraphInit, type GraphNodes, type TrackNodes } from './graph';
 import { Sequencer, planSequence, type SeqSettings, type Step } from '../music/sequencer';
 
-/** Two tracks you record onto, and the Bounce track (index 2) that they are dubbed onto. */
-export const TRACKS = 3;
-export const MIC_TRACKS = 2;
-export const BOUNCE = 2;
+/** Two loop tracks, both recorded from the mic. */
+export const TRACKS = 2;
 export type EngineKind = 'spectral' | 'granular' | 'tape';
-/** A loop is one channel (a mic take) or two (the Bounce track keeps the stereo image). */
+/** A loop is a list of channels; mic takes are mono. */
 export type Loop = Float32Array[];
 
-export const trackName = (i: number): string => (i === BOUNCE ? 'Bounce' : `Track ${i + 1}`);
+export const trackName = (i: number): string => `Track ${i + 1}`;
 
 /** Per-mode sound controls. Each mode keeps its own, so switching modes never loses a setting. */
 export interface TapeSound {
@@ -92,7 +88,14 @@ export interface TrackState {
   stretch: number;
   /** seconds a stretch change takes to arrive (0 = instant); on tape it is the motor's inertia */
   glide: number;
+  /** semitones, −24…+24 (shown even when linked to the stretch) */
   pitch: number;
+  /**
+   * Pitch and stretch move together, as on tape, where slowing the reel drops the pitch.
+   * On: pitch follows stretch (−12 st per doubling) and the pitch slider follows too.
+   * Off: they are independent (what Spectral and Granular are for).
+   */
+  link: boolean;
   reverse: boolean;
   freeze: boolean;
   start: number;
@@ -100,11 +103,9 @@ export interface TrackState {
   level: number;
   pan: number;
   mute: boolean;
-  /** FX bus send, 0–1 (taken before the level fader) */
-  send: number;
   /** recording layers over the loop instead of replacing it */
   overdub: boolean;
-  /** how much of the old loop survives an overdub / dub (1 = all of it) */
+  /** how much of the old loop survives an overdub (1 = all of it) */
   keep: number;
   sound: SoundState;
   /** length of the loop in seconds; 0 = empty */
@@ -120,13 +121,14 @@ export interface ResoState {
   bright: number;
   spread: number;
   glide: number;
+  /** in the FX chain (off = the signal goes around it) */
+  on: boolean;
   /** noise burst on every note change (0 = off) */
   pluck: number;
   /** pluck whenever the incoming audio has a hit in it: detector sensitivity (0 = off) */
   onset: number;
   /** how much of the incoming audio rings the strings */
   input: number;
-  mix: number;
 }
 export interface DelayState {
   /** ms */
@@ -134,7 +136,7 @@ export interface DelayState {
   feedback: number;
   tone: number;
   pingpong: boolean;
-  mix: number;
+  on: boolean;
 }
 export interface ReverbState {
   size: number;
@@ -143,14 +145,14 @@ export interface ReverbState {
   damping: number;
   shimmer: number;
   freeze: boolean;
-  mix: number;
+  on: boolean;
 }
 export interface FxState {
   reso: ResoState;
   delay: DelayState;
   reverb: ReverbState;
-  /** FX bus return level 0–1 */
-  level: number;
+  /** Wet/Dry: 0 = only the direct sound, 1 = only the effects */
+  wet: number;
 }
 
 export const RESO_CHORD_NAMES = ['Single', 'Octaves', 'Fifths', 'Minor', 'Major', 'Sus4', 'Minor 9'];
@@ -161,8 +163,8 @@ export const noteOf = (root: number, octave: number): number => 12 * (octave + 1
 /** What a saved project holds (the audio is stored beside it). */
 export interface ProjectData {
   app: 'FieldStretcher';
-  /** 1 = the four-track version */
-  v: 1 | 2;
+  /** 1 = four tracks, 2 = two tracks + Bounce (both still open) */
+  v: 1 | 2 | 3;
   sampleRate: number;
   masterLevel: number;
   tracks: Omit<TrackState, 'seconds'>[];
@@ -193,10 +195,10 @@ export interface SeqState {
 const LOOKAHEAD = 1.2;
 
 const defaultFx = (): FxState => ({
-  reso: { root: 9, octave: 3, chord: 2, decay: 0.7, bright: 0.5, spread: 0.3, glide: 0.4, pluck: 0, onset: 0, input: 1, mix: 0.5 },
-  delay: { time: 420, feedback: 0.5, tone: 0.6, pingpong: true, mix: 0.3 },
-  reverb: { size: 1, decay: 8, damping: 0.4, shimmer: 0, freeze: false, mix: 0.35 },
-  level: 0.8,
+  reso: { root: 9, octave: 3, chord: 2, decay: 0.7, bright: 0.5, spread: 0.3, glide: 0.4, on: true, pluck: 0, onset: 0, input: 1 },
+  delay: { time: 420, feedback: 0.5, tone: 0.6, pingpong: true, on: true },
+  reverb: { size: 1, decay: 8, damping: 0.4, shimmer: 0, freeze: false, on: true },
+  wet: 0,
 });
 
 
@@ -209,6 +211,8 @@ export interface EngineEvents {
   recTime(track: number, seconds: number): void;
   recAutoStop(track: number): void;
   blowup(): void;
+  /** a track's stretch, pitch, link or mode changed from code (so the sliders must follow) */
+  trackParams(track: number): void;
   /** a track's audio was loaded, replaced or cleared */
   track(track: number): void;
   /** the whole state was replaced (project opened, scene applied, new project): rebuild the UI */
@@ -217,10 +221,6 @@ export interface EngineEvents {
   bounceTime(seconds: number): void;
   /** mix recording hit its length limit */
   bounceAutoStop(): void;
-  /** dub progress, seconds */
-  dubTime(seconds: number): void;
-  /** a dub hit the Bounce track's length limit */
-  dubAutoStop(): void;
   /** granular grains just spawned: [position 0–1, length 0–1, pan, semitones, direction ±1] */
   grains(track: number, grains: number[][]): void;
 }
@@ -233,21 +233,42 @@ export interface Scene {
   name: string;
   blurb: string;
   tracks: SceneTrack[];
-  fx: { reso?: Partial<ResoState>; delay?: Partial<DelayState>; reverb?: Partial<ReverbState>; level?: number };
+  fx: { reso?: Partial<ResoState>; delay?: Partial<DelayState>; reverb?: Partial<ReverbState>; wet?: number };
   seq?: Partial<SeqSettings & { rate: number }>;
   seqOn?: boolean;
   /** saved by the user (can be deleted) */
   user?: boolean;
 }
 
-export type RecResult = { ok: true } | { ok: false; reason: 'short' | 'quiet' | 'idle' | 'busy' };
+export type RecResult = { ok: true } | { ok: false; reason: 'short' | 'quiet' | 'idle' };
 
-/** Every track starts as a plain loop at normal speed (tape at 1×), with nothing sent to the FX. */
+/** Stretch limits (a stretch below 1 plays faster than normal). */
+export const MIN_STRETCH = 0.25;
+export const MAX_STRETCH = 1000;
+const clampStretch = (s: number) => Math.min(MAX_STRETCH, Math.max(MIN_STRETCH, s));
+
+/** The pitch change that goes with a stretch on tape: −12 semitones per doubling, shown within ±24. */
+export const pitchOfStretch = (stretch: number): number => Math.max(-24, Math.min(24, -12 * Math.log2(stretch)));
+/** The stretch that goes with a pitch on tape. */
+export const stretchOfPitch = (pitch: number): number => clampStretch(Math.pow(2, -pitch / 12));
+
+/**
+ * The pitch shift the audio engine is given. Linked on TAPE, the speed is simply 1 ÷ stretch (so the
+ * pitch already follows it; nothing is added). Linked on Spectral or Granular, the pitch follows the
+ * stretch the way tape's does. Unlinked, the pitch is whatever is set, independent of the stretch.
+ */
+export function effectivePitch(t: Pick<TrackState, 'link' | 'engine' | 'stretch' | 'pitch'>): number {
+  if (!t.link) return t.pitch;
+  return t.engine === 'tape' ? 0 : pitchOfStretch(t.stretch);
+}
+
+/** Every track starts as a plain loop at normal speed (tape at 1×, pitch and stretch linked). */
 const defaultTrack = (): TrackState => ({
   engine: 'tape',
   stretch: 1,
   glide: 0,
   pitch: 0,
+  link: true,
   reverse: false,
   freeze: false,
   start: 0,
@@ -255,7 +276,6 @@ const defaultTrack = (): TrackState => ({
   level: 0.8,
   pan: 0,
   mute: false,
-  send: 0,
   overdub: false,
   keep: 1,
   sound: defaultSound(),
@@ -310,8 +330,6 @@ export class Engine {
   masterLevel = 0.85;
   micError: string | null = null;
   recTrack = -1;
-  /** the track being dubbed onto Bounce, or -1 */
-  dubSource = -1;
   bouncing = false;
   /** audio-path facts for the Settings sheet */
   diag: { ctxRate: number; micRate: number | null; take: TakeInfo | null } = { ctxRate: 0, micRate: null, take: null };
@@ -339,7 +357,6 @@ export class Engine {
   private tapChunks: { l: Float32Array; r: Float32Array }[] = [];
   private tapSamples = 0;
   private tapDone: (() => void) | null = null;
-  private dubOffset = 0;
 
   /** Subscribe to any state change (autosave). `audioTrack` is set when that track's audio changed. */
   onChange(fn: (audioTrack?: number) => void): void {
@@ -372,9 +389,6 @@ export class Engine {
   }
   get hasMic(): boolean {
     return this.capture !== null;
-  }
-  get dubbing(): boolean {
-    return this.dubSource >= 0;
   }
 
   /** Must be called from a tap. Safe to call again (e.g. to resume). */
@@ -420,7 +434,6 @@ export class Engine {
 
   private muteGain(i: number): number {
     const t = this.tracks[i];
-    if (this.dubSource >= 0) return i === this.dubSource ? 1 : 0; // a dub hears the source on its own
     if (this.recTrack === i && !this.recOverdub) return 0; // a track being re-recorded goes quiet
     return t.mute ? 0 : 1;
   }
@@ -448,15 +461,14 @@ export class Engine {
         mute: o.live ? this.muteGain(i) : o.solo === undefined || o.solo === null ? (t.mute ? 0 : 1) : i === o.solo ? 1 : 0,
         gain: t.level ** 2,
         pan: t.pan,
-        send: t.send ** 2,
       })),
       fx: {
         reso,
         delay: this.delayParams(),
         reverb: this.reverbParams(),
-        mix: { reso: fx.reso.mix, delay: fx.delay.mix, reverb: fx.reverb.mix },
-        level: fx.level ** 2,
+        on: { reso: fx.reso.on, delay: fx.delay.on, reverb: fx.reverb.on },
       },
+      wet: fx.wet,
       master: this.masterLevel ** 2,
       resoQueue,
       report: o.live,
@@ -500,7 +512,7 @@ export class Engine {
       engine: t.engine,
       stretch: t.stretch,
       glide: t.glide,
-      pitch: t.pitch,
+      pitch: effectivePitch(t),
       reverse: t.reverse ? 1 : 0,
       freeze: t.freeze ? 1 : 0,
       start: t.start,
@@ -539,17 +551,28 @@ export class Engine {
     const st = this.g.stages[section];
     const params = section === 'reso' ? this.resoParams() : section === 'delay' ? this.delayParams() : this.reverbParams();
     st.node.port.postMessage({ type: 'params', params });
-    if ('mix' in patch) {
-      const w = dryWet(this.fx[section].mix);
-      st.dry.gain.setTargetAtTime(w.dry, this.ctx.currentTime, 0.03);
-      st.wet.gain.setTargetAtTime(w.wet, this.ctx.currentTime, 0.03);
+    if ('on' in patch) {
+      const on = !!this.fx[section].on;
+      st.proc.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.03);
+      st.around.gain.setTargetAtTime(on ? 0 : 1, this.ctx.currentTime, 0.03);
+      this.applyWet();
     }
   }
 
-  setFxLevel(v: number) {
-    this.fx.level = v;
+  /** Wet/Dry: 0 = only the direct sound, 1 = only the effects. */
+  setWet(v: number) {
+    this.fx.wet = v;
     this.touch();
-    if (this.ctx && this.g) this.g.busOut.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
+    this.fxChanged();
+    this.applyWet();
+  }
+
+  private applyWet() {
+    if (!this.ctx || !this.g) return;
+    const fx = this.fx;
+    const now = this.ctx.currentTime;
+    this.g.dry.gain.setTargetAtTime(wetDryGains(fx.wet).dry, now, 0.02);
+    this.g.wet.gain.setTargetAtTime(wetPathGain(fx.wet, { reso: fx.reso.on, delay: fx.delay.on, reverb: fx.reverb.on }), now, 0.02);
   }
 
   /* ---------------------------------------------------------- sequencer -- */
@@ -715,7 +738,7 @@ export class Engine {
 
   /** Record the mic onto a track. With Overdub on (and something already there) it layers over the loop instead of replacing it. */
   startRecording(track: number): boolean {
-    if (!this.capture || this.recTrack >= 0 || this.dubSource >= 0 || track >= MIC_TRACKS) return false;
+    if (!this.capture || this.recTrack >= 0 || track >= TRACKS) return false;
     this.chunks = [];
     this.recSamples = 0;
     this.recTrack = track;
@@ -834,9 +857,8 @@ export class Engine {
     if (!this.ctx) return { ok: false, reason: 'idle' };
     const decoded = await this.ctx.decodeAudioData(await file.arrayBuffer());
     const all = Array.from({ length: decoded.numberOfChannels }, (_, c) => decoded.getChannelData(c));
-    // the Bounce track keeps a stereo image; the mic tracks are mono
-    let chans: Loop = track === BOUNCE && all.length >= 2 ? [all[0], all[1]] : [toMono(all)];
-    const max = Math.floor((track === BOUNCE ? MAX_BOUNCE_SECONDS : MAX_SECONDS) * decoded.sampleRate);
+    let chans: Loop = [toMono(all)];
+    const max = Math.floor(MAX_SECONDS * decoded.sampleRate);
     if (chans[0].length > max) chans = chans.map((c) => c.slice(0, max));
     if (decoded.sampleRate !== this.sampleRate) chans = chans.map((c) => resampleTo(c, Math.round((c.length * this.sampleRate) / decoded.sampleRate)));
     const res = prepareLoop(chans, this.sampleRate);
@@ -855,7 +877,7 @@ export class Engine {
     const n = this.g?.tracks[track];
     if (!n) return;
     n.looper.port.postMessage({ type: 'params', params: this.looperParams(t) });
-    if ('level' in patch || 'mute' in patch || 'send' in patch) this.applyMix(track);
+    if ('level' in patch || 'mute' in patch) this.applyMix(track);
     if ('pan' in patch) n.pan.pan.setTargetAtTime(t.pan, this.ctx!.currentTime, 0.02);
   }
 
@@ -867,6 +889,47 @@ export class Engine {
     this.g?.tracks[track]?.looper.port.postMessage({ type: 'params', params: this.looperParams(t) });
   }
 
+  /** Change the stretch. If pitch and stretch are linked the pitch follows. */
+  setStretch(track: number, stretch: number) {
+    const t = this.tracks[track];
+    const s = clampStretch(stretch);
+    this.update(track, t.link ? { stretch: s, pitch: pitchOfStretch(s) } : { stretch: s });
+    this.events.trackParams?.(track);
+  }
+
+  /** Change the pitch (semitones). If pitch and stretch are linked the stretch follows, as on a tape reel. */
+  setPitch(track: number, pitch: number) {
+    const t = this.tracks[track];
+    const p = Math.max(-24, Math.min(24, pitch));
+    this.update(track, t.link ? { pitch: p, stretch: stretchOfPitch(p) } : { pitch: p });
+    this.events.trackParams?.(track);
+  }
+
+  /**
+   * Link or unlink pitch and stretch without a jump where that is possible.
+   * Linking on tape keeps the speed you hear (the stretch is recomputed from the speed);
+   * unlinking keeps the pitch you hear (tape: the offset goes back to 0; the others keep the derived pitch).
+   */
+  setLink(track: number, on: boolean) {
+    const t = this.tracks[track];
+    if (on === t.link) return;
+    if (on) {
+      if (t.engine === 'tape') t.stretch = clampStretch(t.stretch * Math.pow(2, -t.pitch / 12));
+      this.update(track, { link: true, stretch: t.stretch, pitch: pitchOfStretch(t.stretch) });
+    } else this.update(track, { link: false, pitch: t.engine === 'tape' ? 0 : pitchOfStretch(t.stretch) });
+    this.events.trackParams?.(track);
+  }
+
+  /** Switch the stretch mode. Tape is linked (that is what tape is); the other modes start independent, keeping the pitch you were hearing. */
+  setEngine(track: number, kind: EngineKind) {
+    const t = this.tracks[track];
+    if (kind === t.engine) return;
+    if (kind === 'tape') this.update(track, { engine: kind, link: true, pitch: pitchOfStretch(t.stretch) });
+    else if (t.engine === 'tape') this.update(track, { engine: kind, link: false, pitch: t.link ? pitchOfStretch(t.stretch) : t.pitch });
+    else this.update(track, { engine: kind });
+    this.events.trackParams?.(track);
+  }
+
   private applyMix(track: number) {
     const t = this.tracks[track];
     const n: TrackNodes | undefined = this.g?.tracks[track];
@@ -874,7 +937,6 @@ export class Engine {
     const now = this.ctx.currentTime;
     n.mute.gain.setTargetAtTime(this.muteGain(track), now, 0.02);
     n.gain.gain.setTargetAtTime(t.level * t.level, now, 0.02);
-    n.send.gain.setTargetAtTime(t.send * t.send, now, 0.02);
   }
 
   private applyAllMix() {
@@ -930,13 +992,8 @@ export class Engine {
           this.tapChunks.push({ l: m.l, r: m.r });
           this.tapSamples += m.l.length;
           const sec = this.tapSamples / this.sampleRate;
-          if (this.dubSource >= 0) {
-            this.events.dubTime?.(sec);
-            if (sec >= MAX_BOUNCE_SECONDS) this.events.dubAutoStop?.();
-          } else {
-            this.events.bounceTime?.(sec);
-            if (sec >= MAX_MIX_SECONDS) this.events.bounceAutoStop?.();
-          }
+          this.events.bounceTime?.(sec);
+          if (sec >= MAX_MIX_SECONDS) this.events.bounceAutoStop?.();
         } else if (m.type === 'recStopped') this.tapDone?.();
       };
       const silent = this.ctx.createGain();
@@ -972,7 +1029,7 @@ export class Engine {
 
   /** Start recording what comes out of the speakers (after the limiter). */
   startBounce(): boolean {
-    if (!this.started || this.bouncing || this.dubSource >= 0) return false;
+    if (!this.started || this.bouncing) return false;
     if (!this.tapStart()) return false;
     this.bouncing = true;
     return true;
@@ -985,62 +1042,12 @@ export class Engine {
     return out ? { ...out, sampleRate: this.sampleRate } : null;
   }
 
-  /**
-   * Dub a track onto the Bounce track. The source plays on its own (stretch, pitch,
-   * its FX send and the tails of the FX bus) and what comes out is recorded. The first
-   * dub becomes the Bounce loop; later dubs are layered onto it from the loop position
-   * where they began, the old audio kept by the Bounce track's "keep" amount.
-   */
-  startDub(source: number): boolean {
-    if (!this.started || source >= MIC_TRACKS || !this.loops[source] || this.dubSource >= 0 || this.bouncing || this.recTrack >= 0) return false;
-    const old = this.loops[BOUNCE];
-    this.dubOffset = old ? Math.floor(this.lastPos[BOUNCE] * old[0].length) : 0;
-    this.dubSource = source;
-    this.applyAllMix();
-    if (!this.playing) this.setPlaying(true);
-    if (!this.tapStart()) {
-      this.dubSource = -1;
-      this.applyAllMix();
-      return false;
-    }
-    return true;
-  }
-
-  async stopDub(): Promise<RecResult> {
-    if (this.dubSource < 0) return { ok: false, reason: 'idle' };
-    const out = await this.tapStop();
-    this.dubSource = -1;
-    this.applyAllMix();
-    if (!out) return { ok: false, reason: 'short' };
-    const sr = this.sampleRate;
-    const max = Math.floor(MAX_BOUNCE_SECONDS * sr);
-    const l = out.l.length > max ? out.l.subarray(0, max) : out.l;
-    const r = out.r.length > max ? out.r.subarray(0, max) : out.r;
-    const old = this.loops[BOUNCE];
-    if (!old) {
-      const res = prepareLoop([l, r], sr);
-      if (!res.ok) return { ok: false, reason: res.reason };
-      this.setBuffer(BOUNCE, res.chans);
-    } else {
-      if (l.length < 0.1 * sr) return { ok: false, reason: 'short' };
-      if (peakOf([l, r]) < 0.001) return { ok: false, reason: 'quiet' };
-      const dl = old[0].slice();
-      const dr = (old[1] ?? old[0]).slice();
-      const keep = this.tracks[BOUNCE].keep;
-      layerInto(dl, l, this.dubOffset, keep);
-      layerInto(dr, r, this.dubOffset, keep);
-      this.setBuffer(BOUNCE, [dl, dr], true);
-    }
-    if (!this.playing) this.setPlaying(true);
-    return { ok: true };
-  }
-
   /* ----------------------------------------------------------- projects -- */
 
   getProject(): ProjectData {
     return {
       app: 'FieldStretcher',
-      v: 2,
+      v: 3,
       sampleRate: this.sampleRate,
       masterLevel: this.masterLevel,
       tracks: this.tracks.map(({ seconds: _s, ...t }) => JSON.parse(JSON.stringify(t)) as Omit<TrackState, 'seconds'>),
@@ -1057,10 +1064,14 @@ export class Engine {
    */
   applyProject(d: Partial<ProjectData>, loops: (Loop | null)[], audioRate: number) {
     const def = defaultFx();
-    const f = (d.fx ?? {}) as Partial<FxState>;
-    const r = (f.reso ?? {}) as Partial<ResoState>;
-    const dl = (f.delay ?? {}) as Partial<DelayState>;
-    const rv = (f.reverb ?? {}) as Partial<ReverbState>;
+    const f = (d.fx ?? {}) as Partial<FxState> & { level?: number };
+    const r = (f.reso ?? {}) as Partial<ResoState> & { mix?: number };
+    const dl = (f.delay ?? {}) as Partial<DelayState> & { mix?: number };
+    const rv = (f.reverb ?? {}) as Partial<ReverbState> & { mix?: number };
+    // a project saved before the single Wet/Dry control had a send per track and a mix per effect:
+    // the loudest send becomes the Wet/Dry, and an effect whose mix was ~0 comes in switched off
+    const legacySend = Math.max(0, ...((d.tracks ?? []) as { send?: number }[]).slice(0, TRACKS).map((t) => (typeof t?.send === 'number' ? t.send : 0)));
+    const wasOn = (v: boolean | undefined, mix: number | undefined, dflt: boolean) => (typeof v === 'boolean' ? v : typeof mix === 'number' ? mix > 0.02 : dflt);
     this.fx = {
       reso: {
         root: Math.round(num(r.root, 0, 11, def.reso.root)),
@@ -1070,17 +1081,17 @@ export class Engine {
         bright: num(r.bright, 0, 1, def.reso.bright),
         spread: num(r.spread, 0, 1, def.reso.spread),
         glide: num(r.glide, 0.004, 4, def.reso.glide),
+        on: wasOn(r.on, r.mix, def.reso.on),
         pluck: num(r.pluck, 0, 1, def.reso.pluck),
         onset: num(r.onset, 0, 1, def.reso.onset),
         input: num(r.input, 0, 1, def.reso.input),
-        mix: num(r.mix, 0, 1, def.reso.mix),
       },
       delay: {
         time: num(dl.time, 50, 1500, def.delay.time),
         feedback: num(dl.feedback, 0, 0.95, def.delay.feedback),
         tone: num(dl.tone, 0, 1, def.delay.tone),
         pingpong: bool(dl.pingpong, def.delay.pingpong),
-        mix: num(dl.mix, 0, 1, def.delay.mix),
+        on: wasOn(dl.on, dl.mix, def.delay.on),
       },
       reverb: {
         size: num(rv.size, 0.3, 2, def.reverb.size),
@@ -1088,9 +1099,9 @@ export class Engine {
         damping: num(rv.damping, 0, 0.95, def.reverb.damping),
         shimmer: num(rv.shimmer, 0, 1, def.reverb.shimmer),
         freeze: bool(rv.freeze, def.reverb.freeze),
-        mix: num(rv.mix, 0, 1, def.reverb.mix),
+        on: wasOn(rv.on, rv.mix, def.reverb.on),
       },
-      level: num(f.level, 0, 1, def.level),
+      wet: num(f.wet, 0, 1, Math.min(1, legacySend)),
     };
     const kinds: EngineKind[] = ['spectral', 'granular', 'tape'];
     const fresh = defaultTrack();
@@ -1098,15 +1109,16 @@ export class Engine {
       const src = (d.tracks?.[i] ?? {}) as Partial<TrackState>;
       const tr = this.tracks[i];
       tr.engine = kinds.includes(src.engine as EngineKind) ? (src.engine as EngineKind) : fresh.engine;
-      tr.stretch = num(src.stretch, 1, 1000, fresh.stretch);
+      tr.stretch = num(src.stretch, MIN_STRETCH, MAX_STRETCH, fresh.stretch);
       tr.glide = num(src.glide, 0, 10, fresh.glide);
-      tr.pitch = Math.round(num(src.pitch, -24, 24, 0));
+      tr.pitch = num(src.pitch, -24, 24, 0);
+      // older files have no link. A tape track with no pitch offset is simply linked; one WITH an offset opens unlinked so it sounds as it did
+      tr.link = bool(src.link, tr.engine === 'tape' && tr.pitch === 0);
       tr.reverse = bool(src.reverse, false);
       tr.freeze = bool(src.freeze, false);
       tr.level = num(src.level, 0, 1, fresh.level);
       tr.pan = num(src.pan, -1, 1, 0);
       tr.mute = bool(src.mute, false);
-      tr.send = num(src.send, 0, 1, fresh.send);
       tr.overdub = bool(src.overdub, false);
       tr.keep = num(src.keep, 0, 1, fresh.keep);
       tr.sound = readSound(src.sound);
@@ -1138,8 +1150,8 @@ export class Engine {
     // push everything to the audio side
     if (this.ctx && this.g) {
       this.setMaster(this.masterLevel);
-      this.setFxLevel(this.fx.level);
-      for (const sec of ['reso', 'delay', 'reverb'] as const) this.updateFx(sec, { mix: this.fx[sec].mix });
+      for (const sec of ['reso', 'delay', 'reverb'] as const) this.updateFx(sec, { on: this.fx[sec].on });
+      this.applyWet();
       this.g.stages.reso.node.port.postMessage({ type: 'chord' });
       this.applyAllMix();
     }
@@ -1160,13 +1172,16 @@ export class Engine {
       ...cur,
       tracks: cur.tracks.map((t, i) => {
         const s = scene.tracks[i] ?? {};
-        return { ...t, ...s, sound: mergeSound(t.sound, s.sound), start: t.start, end: t.end };
+        const merged = { ...t, ...s, sound: mergeSound(t.sound, s.sound), start: t.start, end: t.end };
+        // a scene that changes the mode without saying otherwise gets that mode's usual link
+        if (s.engine !== undefined && s.link === undefined) merged.link = s.engine === 'tape';
+        return merged;
       }),
       fx: {
         reso: { ...cur.fx.reso, ...scene.fx.reso },
         delay: { ...cur.fx.delay, ...scene.fx.delay },
         reverb: { ...cur.fx.reverb, ...scene.fx.reverb },
-        level: scene.fx.level ?? cur.fx.level,
+        wet: scene.fx.wet ?? cur.fx.wet,
       },
       seq: { ...cur.seq, ...scene.seq },
     };
