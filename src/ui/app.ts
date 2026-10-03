@@ -5,6 +5,7 @@
 import { Engine, TRACKS, type EngineKind, type Quality } from '../audio/engine';
 import { MAX_SECONDS } from '../audio/loopfx';
 import { Wave } from './wave';
+import { buildFxPanel } from './fxPanel';
 import { fmtSemis, fmtStretch, fmtTime, h, posFromStretch, stretchFromPos } from './dom';
 
 const ENGINES: { id: EngineKind; label: string; tip: string }[] = [
@@ -64,6 +65,7 @@ export function mountApp(root: HTMLElement, engine: Engine) {
       stretchOut.textContent = fmtStretch(s);
       syncChips();
     });
+    const sendOut = h('output', { class: 'mono val' }, `${Math.round(t.send * 100)}%`);
     const pitchOut = h('output', { class: 'mono val' }, fmtSemis(t.pitch));
     const pitch = input('', -24, 24, 1, t.pitch, 'pitch', (v) => {
       engine.update(i, { pitch: v });
@@ -147,6 +149,7 @@ export function mountApp(root: HTMLElement, engine: Engine) {
         stretch,
         h('div', { class: 'chips' }, ...chips),
       ),
+      h('div', { class: 'row send' }, h('label', {}, 'Send'), input('', 0, 1, 0.01, t.send, 'FX send', (v) => { engine.update(i, { send: v }); sendOut.textContent = `${Math.round(v * 100)}%`; }), sendOut),
       h('div', { class: 'toggles' }, reverse, freeze),
       more,
     );
@@ -244,8 +247,17 @@ export function mountApp(root: HTMLElement, engine: Engine) {
   );
   const transport = h('footer', { class: 'transport' }, playBtn, h('label', { class: 'master' }, h('span', {}, 'Master'), master));
 
-  const main = h('main', { class: 'tracks' }, micNote, ...cards.map((c) => c.root));
-  const shell = h('div', { class: 'shell' }, header, banner, main, transport, sheet, toast);
+  const trackList = h('main', { class: 'tracks', id: 'tab-tracks' }, micNote, ...cards.map((c) => c.root));
+  const fxList = h('main', { class: 'tracks', id: 'tab-fx', hidden: true }, buildFxPanel(engine));
+  const panels = [trackList, fxList];
+  const tabBtns = ['Tracks', 'FX'].map((label, k) =>
+    h('button', { class: 'tab', role: 'tab', 'aria-selected': k === 0, onclick: () => {
+      tabBtns.forEach((b, j) => b.setAttribute('aria-selected', String(j === k)));
+      panels.forEach((p, j) => (p.hidden = j !== k));
+    } }, label),
+  );
+  const tabs = h('nav', { class: 'tabs', role: 'tablist' }, ...tabBtns);
+  const shell = h('div', { class: 'shell' }, header, tabs, banner, trackList, fxList, transport, sheet, toast);
 
   /* ------------------------------------------------------------- splash -- */
 

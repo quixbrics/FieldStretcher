@@ -7,9 +7,10 @@ import common from './dsp/common.js?raw';
 import looper from './dsp/looper.js?raw';
 import safety from './dsp/safety.js?raw';
 import capture from './dsp/capture.js?raw';
+import fxBus from './dsp/fx-bus.js?raw';
 
 // keep in step with DSP_FILES (src/audio/dspFiles.ts)
-const SOURCE = [common, looper, safety, capture].join('\n;\n');
+const SOURCE = [common, looper, safety, capture, fxBus].join('\n;\n');
 
 let url: string | null = null;
 const loaded = new WeakMap<BaseAudioContext, Promise<void>>();

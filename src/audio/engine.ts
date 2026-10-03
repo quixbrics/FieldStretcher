@@ -4,9 +4,13 @@
  *
  *   mic ─► fs-capture (raw PCM, meter) ─► [taken when a track is armed]
  *
- *   track 1..4:  fxm-looper ─► level ─► pan ─┐
- *                                            ├─► master ─► fxm-safety ─► out
- *   (phase 2: post-fader sends ─► FX bus ────┘)
+ *   track 1..4:  fxm-looper ─► mute ─┬─► level ─► pan ──────────┐
+ *                                    └─► send ─► FX BUS ─► return ┴─► master ─► fxm-safety ─► out
+ *
+ *   FX BUS:  reso ─► delay ─► reverb, each blended dry/wet (equal power)
+ *
+ * The send is taken BEFORE the level fader, so turning a track's level down
+ * while its send is up gives a wet-only sound. Mute and recording silence both.
  *
  * The context is created inside the first tap (iOS refuses otherwise), and the
  * mic request is fired in that same tap, in parallel with loading the DSP.
@@ -31,8 +35,69 @@ export interface TrackState {
   level: number;
   pan: number;
   mute: boolean;
+  /** FX bus send, 0–1 (taken before the level fader) */
+  send: number;
   /** length of the loop in seconds; 0 = empty */
   seconds: number;
+}
+
+export interface ResoState {
+  /** pitch class 0–11 (C = 0) and octave; together they give the note when no sequencer is moving it */
+  root: number;
+  octave: number;
+  chord: number;
+  decay: number;
+  bright: number;
+  spread: number;
+  glide: number;
+  mix: number;
+}
+export interface DelayState {
+  /** ms */
+  time: number;
+  feedback: number;
+  tone: number;
+  pingpong: boolean;
+  mix: number;
+}
+export interface ReverbState {
+  size: number;
+  /** seconds (RT60) */
+  decay: number;
+  damping: number;
+  shimmer: number;
+  freeze: boolean;
+  mix: number;
+}
+export interface FxState {
+  reso: ResoState;
+  delay: DelayState;
+  reverb: ReverbState;
+  /** FX bus return level 0–1 */
+  level: number;
+}
+
+export const RESO_CHORD_NAMES = ['Single', 'Octaves', 'Fifths', 'Minor', 'Major', 'Sus4', 'Minor 9'];
+export const NOTE_NAMES = ['C', 'C♯', 'D', 'E♭', 'E', 'F', 'F♯', 'G', 'A♭', 'A', 'B♭', 'B'];
+/** MIDI note of a root + octave (octave 3, A = 57 = A3 = 220 Hz) */
+export const noteOf = (root: number, octave: number): number => 12 * (octave + 1) + root;
+
+const defaultFx = (): FxState => ({
+  reso: { root: 9, octave: 3, chord: 2, decay: 0.6, bright: 0.5, spread: 0.3, glide: 0.4, mix: 0.5 },
+  delay: { time: 420, feedback: 0.5, tone: 0.6, pingpong: true, mix: 0.3 },
+  reverb: { size: 1, decay: 8, damping: 0.4, shimmer: 0, freeze: false, mix: 0.35 },
+  level: 0.8,
+});
+
+/** equal-power dry/wet gains for a 0–1 mix */
+const dryWet = (mix: number) => ({ dry: Math.cos((mix * Math.PI) / 2), wet: Math.sin((mix * Math.PI) / 2) });
+
+interface Stage {
+  input: GainNode;
+  output: GainNode;
+  dry: GainNode;
+  wet: GainNode;
+  node: AudioWorkletNode;
 }
 
 export interface EngineEvents {
@@ -58,8 +123,11 @@ const DEFAULTS: Pick<TrackState, 'engine' | 'stretch'>[] = [
 
 interface TrackNodes {
   looper: AudioWorkletNode;
+  /** mute / recording silence — before both the dry path and the send */
+  mute: GainNode;
   gain: GainNode;
   pan: StereoPannerNode;
+  send: GainNode;
 }
 
 type AudioSessionNav = Navigator & { audioSession?: { type: string } };
@@ -77,8 +145,10 @@ export class Engine {
     level: 0.8,
     pan: 0,
     mute: false,
+    send: 0.3,
     seconds: 0,
   }));
+  fx: FxState = defaultFx();
   /** waveform peaks per track (null = empty) */
   peaks: (Float32Array | null)[] = Array(TRACKS).fill(null);
   /** the loop audio itself (mono), kept for export and redraw */
@@ -91,6 +161,9 @@ export class Engine {
 
   private nodes: TrackNodes[] = [];
   private master!: GainNode;
+  private busIn!: GainNode;
+  private busOut!: GainNode;
+  private stages!: { reso: Stage; delay: Stage; reverb: Stage };
   private safety!: AudioWorkletNode;
   private capture: AudioWorkletNode | null = null;
   private stream: MediaStream | null = null;
@@ -137,6 +210,8 @@ export class Engine {
     };
     this.master.connect(this.safety).connect(ctx.destination);
 
+    this.buildBus(ctx);
+
     for (let i = 0; i < TRACKS; i++) {
       const t = this.tracks[i];
       const looper = workletNode(ctx, 'fxm-looper', { params: this.looperParams(t), seed: 1000 + i, report: true }, 0);
@@ -144,10 +219,14 @@ export class Engine {
         if (e.data.type === 'pos') this.events.pos?.(i, e.data.v);
         else if (e.data.type === 'blowup') this.events.blowup?.();
       };
+      const mute = ctx.createGain();
       const gain = ctx.createGain();
       const pan = ctx.createStereoPanner();
-      looper.connect(gain).connect(pan).connect(this.master);
-      this.nodes.push({ looper, gain, pan });
+      const send = ctx.createGain();
+      looper.connect(mute);
+      mute.connect(gain).connect(pan).connect(this.master);
+      mute.connect(send).connect(this.busIn);
+      this.nodes.push({ looper, mute, gain, pan, send });
       this.applyMix(i);
     }
 
@@ -157,6 +236,76 @@ export class Engine {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && ctx.state !== 'running') void ctx.resume();
     });
+  }
+
+  /** reso → delay → reverb, each stage blended dry/wet, into the return */
+  private buildBus(ctx: AudioContext) {
+    const fx = this.fx;
+    this.busIn = ctx.createGain();
+    this.busOut = ctx.createGain();
+    this.busOut.gain.value = fx.level ** 2;
+    const stage = (name: string, params: Record<string, number>, mix: number): Stage => {
+      const node = workletNode(ctx, name, { params, report: true }, 1);
+      node.port.onmessage = (e) => {
+        if (e.data.type === 'blowup') this.events.blowup?.();
+      };
+      const input = ctx.createGain();
+      const output = ctx.createGain();
+      const dry = ctx.createGain();
+      const wet = ctx.createGain();
+      const g = dryWet(mix);
+      dry.gain.value = g.dry;
+      wet.gain.value = g.wet;
+      input.connect(node).connect(wet).connect(output);
+      input.connect(dry).connect(output);
+      return { input, output, dry, wet, node };
+    };
+    const reso = stage('fxm-reso', this.resoParams(), fx.reso.mix);
+    const delay = stage('fxm-delay', this.delayParams(), fx.delay.mix);
+    const reverb = stage('fxm-fdn', this.reverbParams(), fx.reverb.mix);
+    this.busIn.connect(reso.input);
+    reso.output.connect(delay.input);
+    delay.output.connect(reverb.input);
+    reverb.output.connect(this.busOut).connect(this.master);
+    this.stages = { reso, delay, reverb };
+  }
+
+  private resoParams() {
+    const r = this.fx.reso;
+    return { note: noteOf(r.root, r.octave), chord: r.chord, decay: r.decay, bright: r.bright, spread: r.spread, glide: r.glide };
+  }
+  private delayParams() {
+    const d = this.fx.delay;
+    return {
+      timeL: d.time,
+      // ping-pong alternates evenly; otherwise the right side sits a dotted-feel behind
+      timeR: d.pingpong ? d.time : d.time * 1.5,
+      feedback: d.feedback,
+      pingpong: d.pingpong ? 1 : 0,
+      highcut: 1500 * Math.pow(8, d.tone),
+    };
+  }
+  private reverbParams() {
+    const r = this.fx.reverb;
+    return { size: r.size, decay: r.decay, damping: r.damping, shimmer: r.shimmer, freeze: r.freeze ? 1 : 0 };
+  }
+
+  updateFx<K extends 'reso' | 'delay' | 'reverb'>(section: K, patch: Partial<FxState[K]>) {
+    Object.assign(this.fx[section], patch);
+    if (!this.ctx || !this.stages) return;
+    const st = this.stages[section];
+    const params = section === 'reso' ? this.resoParams() : section === 'delay' ? this.delayParams() : this.reverbParams();
+    st.node.port.postMessage({ type: 'params', params });
+    if ('mix' in patch) {
+      const g = dryWet(this.fx[section].mix);
+      st.dry.gain.setTargetAtTime(g.dry, this.ctx.currentTime, 0.03);
+      st.wet.gain.setTargetAtTime(g.wet, this.ctx.currentTime, 0.03);
+    }
+  }
+
+  setFxLevel(v: number) {
+    this.fx.level = v;
+    if (this.ctx) this.busOut.gain.setTargetAtTime(v * v, this.ctx.currentTime, 0.02);
   }
 
   private async askMic(): Promise<MediaStream | null> {
@@ -303,7 +452,7 @@ export class Engine {
     const n = this.nodes[track];
     if (!n) return;
     n.looper.port.postMessage({ type: 'params', params: this.looperParams(t) });
-    if ('level' in patch || 'mute' in patch) this.applyMix(track);
+    if ('level' in patch || 'mute' in patch || 'send' in patch) this.applyMix(track);
     if ('pan' in patch) n.pan.pan.setTargetAtTime(t.pan, this.ctx!.currentTime, 0.02);
   }
 
@@ -311,8 +460,10 @@ export class Engine {
     const t = this.tracks[track];
     const n = this.nodes[track];
     if (!n || !this.ctx) return;
-    const target = t.mute || this.recTrack === track ? 0 : t.level * t.level;
-    n.gain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.02);
+    const now = this.ctx.currentTime;
+    n.mute.gain.setTargetAtTime(t.mute || this.recTrack === track ? 0 : 1, now, 0.02);
+    n.gain.gain.setTargetAtTime(t.level * t.level, now, 0.02);
+    n.send.gain.setTargetAtTime(t.send * t.send, now, 0.02);
   }
 
   setMaster(v: number) {
@@ -338,6 +489,7 @@ export class Engine {
   panic() {
     for (const n of this.nodes) n.looper.port.postMessage({ type: 'reset' });
     this.safety?.port.postMessage({ type: 'reset' });
+    if (this.stages) for (const st of Object.values(this.stages)) st.node.port.postMessage({ type: 'reset' });
   }
 
   /** Keep the screen (and so the audio) awake while playing. */

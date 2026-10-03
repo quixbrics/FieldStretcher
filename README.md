@@ -2,18 +2,18 @@
 
 Record the world on an iPhone, stretch it into drones — the fourth companion to
 ScapeMaker, ToneMaker and FXMaker. Four looping tracks, each with its own
-stretch engine, (soon) fed into an FX bus of resonator, delay and reverb, with a
+stretch engine, fed into an FX bus of resonator, delay and reverb, with a
 generative sequencer walking the resonator through a scale.
 
 **Static PWA. No backend, no accounts, no running cost.** Open the site in
 Safari, Share → Add to Home Screen, and it runs full-screen and offline.
 
-## Status: Phase 1 (core)
+## Status: Phase 2 (FX bus)
 
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Mic capture, 4 loop tracks, Spectral / Granular / Tape stretch, pitch, reverse, freeze, loop window, level/pan/mute, safety limiter, mobile UI, PWA shell | **built** |
-| 2 | FX bus: resonator → delay → reverb, per-track sends | next |
+| 2 | FX bus: resonator → delay → reverb, per-track sends, FX tab | **built** |
 | 3 | Generative sequencer: scale, motion modes, glide, seed | |
 | 4 | Project save, WAV export + iOS share sheet, presets, polish, Maker Suite card | |
 
@@ -40,6 +40,7 @@ ways to test on an iPhone: deploy to GitHub Pages, or tunnel the dev server
 | Capture | `dsp/capture.js` | Raw Float32 PCM off the audio thread (no MediaRecorder, so no codec and sample-accurate starts), ~85 ms chunks, always-on input meter. Echo cancellation, noise suppression and AGC are all requested **off**. |
 | Takes | `src/audio/loopfx.ts` | DC removed, 20 ms equal-power seam crossfade, normalised to −3 dBFS (gain capped +40 dB; a silent take is refused, not boosted), 0.25–30 s. |
 | Engine | `src/audio/engine.ts` | One context created inside the first tap (mic request fired in the same tap). track: looper → level → pan → master → safety → out. Handles `audioSession`, wake lock, resume after interruption. |
+| FX bus | `dsp/fx-bus.js`, `engine.ts` | reso → delay → reverb, each blended dry/wet (equal power) by gain nodes, then a return fader. Reverb (8-line FDN, optional shimmer and freeze) and tape delay are FXMaker's processors unchanged. The resonator is FXMaker's string bank cut down to one **continuous MIDI note** + chord shape (up to 8 strings), with a `glide` time and an `offsets` message so the Phase 3 sequencer can move it and stack scale-based chords. Sends are **pre-fader**: Level down + Send up = wet-only. |
 | UI | `src/ui/*`, `src/styles/*` | Vanilla TS, portrait, 44 px targets, safe-area insets. `tokens.css` is shared verbatim with the other Maker apps. |
 
 ### Stretch engines
